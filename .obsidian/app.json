@@ -1,0 +1,11 @@
+{
+  "alwaysUpdateLinks": true,
+  "newLinkFormat": "shortest",
+  "useMarkdownLinks": false,
+  "userIgnoreFilters": [
+    "raw/",
+    "inbox/",
+    ".source-snapshots/",
+    ".vault-meta/"
+  ]
+}

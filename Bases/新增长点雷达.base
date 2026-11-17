@@ -1,0 +1,68 @@
+filters:
+  and:
+    - file.inFolder("wiki/opportunities")
+    - file.ext == "md"
+properties:
+  file.basename:
+    displayName: 研究机会卡
+  state:
+    displayName: 当前状态
+  limitation_kind:
+    displayName: 局限/拓展类型
+  origin_source:
+    displayName: 来源论文
+  candidate_dataset:
+    displayName: 候选数据集
+  unlock_condition:
+    displayName: 解锁前置条件
+views:
+  - type: table
+    name: 全部新增长点雷达（按状态分组）
+    groupBy:
+      property: state
+      direction: ASC
+    order:
+      - file.basename
+      - state
+      - limitation_kind
+      - candidate_dataset
+      - unlock_condition
+      - origin_source
+    sort:
+      - property: file.basename
+        direction: ASC
+    columnSize:
+      file.basename: 380
+      unlock_condition: 320
+  - type: table
+    name: 数据与测量已核查（立项另行决定）
+    filters:
+      and:
+        - note.state == "data_ready"
+    order:
+      - file.basename
+      - candidate_dataset
+      - limitation_kind
+      - unlock_condition
+    sort:
+      - property: file.basename
+        direction: ASC
+    columnSize:
+      file.basename: 380
+      unlock_condition: 340
+  - type: table
+    name: 待样本核查与新波次解锁
+    filters:
+      and:
+        - note.state != "data_ready"
+    order:
+      - file.basename
+      - state
+      - candidate_dataset
+      - unlock_condition
+    sort:
+      - property: state
+        direction: ASC
+    columnSize:
+      file.basename: 380
+      unlock_condition: 340

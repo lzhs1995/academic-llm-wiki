@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "timezone": "Asia/Taipei",
+  "schedule": {"cadence": "daily", "hour": 10, "minute": 0},
+  "timeout_seconds": 15,
+  "max_bytes": 2097152,
+  "retries": 2,
+  "max_redirects": 4,
+  "allowlist": [
+    "https://charls.pku.edu.cn/",
+    "https://isss.pku.edu.cn/cfps/",
+    "https://www.isss.pku.edu.cn/cfps/"
+  ],
+  "sources": [
+    {
+      "id": "charls-official",
+      "project": "CHARLS 数据基建",
+      "url": "https://charls.pku.edu.cn/",
+      "description": "CHARLS 官方首页及其公告入口；仅检测此页面字节变化，不推断新数据已发布。"
+    },
+    {
+      "id": "cfps-official",
+      "project": "CFPS 数据基建",
+      "url": "https://www.isss.pku.edu.cn/cfps/",
+      "description": "CFPS 官方首页及其公告入口；登录下载区和外链文档不自动抓取。"
+    }
+  ]
+}

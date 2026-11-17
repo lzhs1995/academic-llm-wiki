@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(raw/**)",
+      "Edit(inbox/**)",
+      "Edit(.source-snapshots/**)"
+    ]
+  }
+}

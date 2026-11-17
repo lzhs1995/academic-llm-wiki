@@ -1,0 +1,55 @@
+filters:
+  and:
+    - file.ext == "md"
+    - or:
+        - file.inFolder("wiki/style")
+        - file.inFolder("wiki/prompts")
+properties:
+  file.basename:
+    displayName: 规范/模板卡片
+  scope:
+    displayName: 适用体例层级
+  rule_count:
+    displayName: 规则条数
+  verified_from:
+    displayName: 真实裁决来源
+  scenarios:
+    displayName: 适用科研场景
+  verified_status:
+    displayName: 验证状态
+  updated:
+    displayName: 更新日期
+views:
+  - type: table
+    name: 个人文风、采用语料与排版经验
+    filters:
+      and:
+        - file.inFolder("wiki/style")
+    order:
+      - file.basename
+      - scope
+      - rule_count
+      - verified_from
+      - updated
+    sort:
+      - property: file.basename
+        direction: ASC
+    columnSize:
+      file.basename: 360
+      verified_from: 340
+  - type: table
+    name: 科研高复用Prompt模板库
+    filters:
+      and:
+        - file.inFolder("wiki/prompts")
+    order:
+      - file.basename
+      - scenarios
+      - verified_status
+      - updated
+    sort:
+      - property: file.basename
+        direction: ASC
+    columnSize:
+      file.basename: 360
+      scenarios: 360

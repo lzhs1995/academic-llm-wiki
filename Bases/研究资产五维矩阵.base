@@ -1,0 +1,108 @@
+filters:
+  and:
+    - file.ext == "md"
+    - or:
+        - file.inFolder("wiki/papers")
+        - file.inFolder("wiki/methods")
+        - file.inFolder("wiki/datasets")
+        - file.inFolder("wiki/variables")
+properties:
+  file.basename:
+    displayName: 卡片名称
+  project_id:
+    displayName: 项目编号
+  status:
+    displayName: 状态
+  dataset:
+    displayName: 数据集
+  design:
+    displayName: 研究设计
+  domain:
+    displayName: 研究领域
+  measure_form:
+    displayName: 指标形态
+  methods:
+    displayName: 核心方法
+  family:
+    displayName: 方法大类
+  software:
+    displayName: 统计软件
+  used_in:
+    displayName: 已用于论文
+  verified_status:
+    displayName: 验证状态
+  survey:
+    displayName: 调查库
+  waves:
+    displayName: 波次覆盖
+  unit:
+    displayName: 分析单位
+  construct_group:
+    displayName: 构念家族
+  datasets:
+    displayName: 适用数据
+  role:
+    displayName: 变量角色
+views:
+  - type: table
+    name: 论文五维全景矩阵
+    filters:
+      and:
+        - file.inFolder("wiki/papers")
+    order:
+      - file.basename
+      - project_id
+      - status
+      - dataset
+      - design
+      - domain
+      - measure_form
+      - methods
+    sort:
+      - property: project_id
+        direction: ASC
+    columnSize:
+      file.basename: 320
+      methods: 260
+  - type: table
+    name: 定量方法复用库
+    filters:
+      and:
+        - file.inFolder("wiki/methods")
+    groupBy:
+      property: family
+      direction: ASC
+    order:
+      - file.basename
+      - family
+      - software
+      - used_in
+      - verified_status
+    sort:
+      - property: file.basename
+        direction: ASC
+    columnSize:
+      file.basename: 360
+      used_in: 240
+  - type: table
+    name: 数据集与变量操作化字典
+    filters:
+      or:
+        - file.inFolder("wiki/datasets")
+        - file.inFolder("wiki/variables")
+    groupBy:
+      property: type
+      direction: ASC
+    order:
+      - file.basename
+      - survey
+      - waves
+      - unit
+      - construct_group
+      - datasets
+      - role
+    sort:
+      - property: file.basename
+        direction: ASC
+    columnSize:
+      file.basename: 380

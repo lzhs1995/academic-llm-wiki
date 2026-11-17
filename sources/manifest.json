@@ -1,0 +1,101 @@
+{
+  "schema": "research-source-registry/v1",
+  "sources": {
+    "src-13ab45eac38b70fac0c1": {
+      "latest_version": "10cd20bace29958f9dd0b886123e6fdf478cb5362eaac2c53f59b0c0aed85178",
+      "logical_id": "demo:dyadic-methods-notes",
+      "versions": [
+        {
+          "adoption_status": "verified_note",
+          "aliases": [
+            "raw/demo/dyadic_methods_notes.md"
+          ],
+          "bytes": 667,
+          "captured_at": "2026-11-17T21:08:27.693108+00:00",
+          "extracted_sha256": "b14aed0833db197a445faaf30cd9654dd5a5bf6c62b4f87bd7164e0fd14755b1",
+          "extractor": "identity/v1",
+          "locator": "document",
+          "logical_id": "demo:dyadic-methods-notes",
+          "metadata": {},
+          "origins": [
+            {
+              "bytes": 667,
+              "path": "raw/demo/dyadic_methods_notes.md",
+              "sha256": "b14aed0833db197a445faaf30cd9654dd5a5bf6c62b4f87bd7164e0fd14755b1"
+            }
+          ],
+          "snapshot_path": ".source-snapshots/src-13ab45eac38b70fac0c1/10cd20bace29958f9dd0b886123e6fdf478cb5362eaac2c53f59b0c0aed85178/content.md",
+          "source_id": "src-13ab45eac38b70fac0c1",
+          "source_path": "raw/demo/dyadic_methods_notes.md",
+          "source_sha256": "b14aed0833db197a445faaf30cd9654dd5a5bf6c62b4f87bd7164e0fd14755b1",
+          "source_type": "method_note",
+          "version": "10cd20bace29958f9dd0b886123e6fdf478cb5362eaac2c53f59b0c0aed85178"
+        }
+      ]
+    },
+    "src-2281781c4cc193204d47": {
+      "latest_version": "0c8436e3c81426180e32b26b5f6d45f5a00fe7db4b451fe6dc9989d2c6a45bd1",
+      "logical_id": "demo:revision-corpus-notes",
+      "versions": [
+        {
+          "adoption_status": "verified_in_final",
+          "aliases": [
+            "raw/demo/revision_corpus_notes.md"
+          ],
+          "bytes": 1088,
+          "captured_at": "2026-11-17T21:08:27.688068+00:00",
+          "extracted_sha256": "fa0ddf00f0e977881c14fc29ee3dfff7b3fe308c1e7a5c4430f760597b19857c",
+          "extractor": "identity/v1",
+          "locator": "document",
+          "logical_id": "demo:revision-corpus-notes",
+          "metadata": {},
+          "origins": [
+            {
+              "bytes": 1088,
+              "path": "raw/demo/revision_corpus_notes.md",
+              "sha256": "fa0ddf00f0e977881c14fc29ee3dfff7b3fe308c1e7a5c4430f760597b19857c"
+            }
+          ],
+          "snapshot_path": ".source-snapshots/src-2281781c4cc193204d47/0c8436e3c81426180e32b26b5f6d45f5a00fe7db4b451fe6dc9989d2c6a45bd1/content.md",
+          "source_id": "src-2281781c4cc193204d47",
+          "source_path": "raw/demo/revision_corpus_notes.md",
+          "source_sha256": "fa0ddf00f0e977881c14fc29ee3dfff7b3fe308c1e7a5c4430f760597b19857c",
+          "source_type": "comparison_record",
+          "version": "0c8436e3c81426180e32b26b5f6d45f5a00fe7db4b451fe6dc9989d2c6a45bd1"
+        }
+      ]
+    },
+    "src-5d198bec0e539cc37417": {
+      "latest_version": "116938b8ad0220f448edf600d552f2bb70308f1ad25b2bdc9a3b2659a7731bd5",
+      "logical_id": "demo:panel-survey-notes",
+      "versions": [
+        {
+          "adoption_status": "verified_note",
+          "aliases": [
+            "raw/demo/panel_survey_notes.md"
+          ],
+          "bytes": 1087,
+          "captured_at": "2026-11-17T21:08:27.682234+00:00",
+          "extracted_sha256": "91d4b3362b37ec125c11f13b118a8af83d57d7bef752ca34425e11711bc3fc28",
+          "extractor": "identity/v1",
+          "locator": "document",
+          "logical_id": "demo:panel-survey-notes",
+          "metadata": {},
+          "origins": [
+            {
+              "bytes": 1087,
+              "path": "raw/demo/panel_survey_notes.md",
+              "sha256": "91d4b3362b37ec125c11f13b118a8af83d57d7bef752ca34425e11711bc3fc28"
+            }
+          ],
+          "snapshot_path": ".source-snapshots/src-5d198bec0e539cc37417/116938b8ad0220f448edf600d552f2bb70308f1ad25b2bdc9a3b2659a7731bd5/content.md",
+          "source_id": "src-5d198bec0e539cc37417",
+          "source_path": "raw/demo/panel_survey_notes.md",
+          "source_sha256": "91d4b3362b37ec125c11f13b118a8af83d57d7bef752ca34425e11711bc3fc28",
+          "source_type": "research_note",
+          "version": "116938b8ad0220f448edf600d552f2bb70308f1ad25b2bdc9a3b2659a7731bd5"
+        }
+      ]
+    }
+  }
+}
