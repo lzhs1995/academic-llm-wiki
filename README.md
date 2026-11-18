@@ -50,7 +50,9 @@ academic-llm-wiki/
 ├── raw/                             # 只读原始证据/笔记快照层（禁止模型直接改写）
 ├── sources/manifest.json            # 来源 SHA-256 指纹与精确行号/记录定位注册表
 ├── .source-snapshots/               # 内容寻址不可变来源快照
-├── skills/research-vault/SKILL.md   # 可直接软链挂载到各 CLI 的技能路由包
+├── skills/
+│   ├── research-vault/SKILL.md      # 学术知识库读写与防幻觉规则技能包
+│   └── scanned-pdf-to-markdown/     # 扫描版/纯图片 PDF 一句话免费离线转带页码 Markdown 技能包（Mac + Windows）
 ├── config/research-watch.json       # CHARLS / CFPS 官网每日 10:00 变更巡检配置
 ├── tools/                           # 零 AI 依赖的纯 Python 确定性校验与维护脚本
 │   ├── wiki-lint.py                 # 全库体检：双链/锚点 + YAML 契约 + Bases 过滤 + 引文联检
@@ -87,6 +89,9 @@ mkdir -p ~/.agents/skills ~/.claude/skills ~/.gemini/skills
 ln -sfn ~/Documents/brain/skills/research-vault ~/.agents/skills/research-vault
 ln -sfn ~/Documents/brain/skills/research-vault ~/.claude/skills/research-vault
 ln -sfn ~/Documents/brain/skills/research-vault ~/.gemini/skills/research-vault
+ln -sfn ~/Documents/brain/skills/scanned-pdf-to-markdown ~/.agents/skills/scanned-pdf-to-markdown
+ln -sfn ~/Documents/brain/skills/scanned-pdf-to-markdown ~/.claude/skills/scanned-pdf-to-markdown
+ln -sfn ~/Documents/brain/skills/scanned-pdf-to-markdown ~/.gemini/skills/scanned-pdf-to-markdown
 ```
 在你的全局规则文件（如 `~/.claude/CLAUDE.md`、`~/.codex/AGENTS.md` 或 WorkBuddy 的全局指令设置）中加一行薄入口即可：
 > `涉及论文选题、方法数据复用、文稿润色或研究进度更新时，先读 ~/Documents/brain/CLAUDE.md 与 ~/Documents/brain/wiki/index.md（按需点名读 3–6 张卡）。`
@@ -94,12 +99,16 @@ ln -sfn ~/Documents/brain/skills/research-vault ~/.gemini/skills/research-vault
 ### 3. （可选）启用每日早上 10:00 自动检查 CHARLS / CFPS 官网更新（macOS）
 将 `tools/launchd/com.example.research-vault-watch.plist` 中的 `/ABSOLUTE/PATH/TO/brain` 替换为你的实际绝对路径，拷入 `~/Library/LaunchAgents/` 后加载。一旦官网页面发生更新，会自动写入 `.vault-meta/research-inbox/items/` 待办队列，下次开研究任务时提醒你查新。
 
-### 4. 扫描版 / 纯图片 PDF 专著入库与双引号直引防错
-针对内嵌文字层为 0 的中英文扫描版电子书，切勿直接把整本百兆扫描 PDF 塞给大模型硬啃，也不要依赖只支持原生文字层的 `MarkItDown`：
-1. 先用 `python3 tools/ingest-scanned-pdf.py "/path/to/book.pdf" --pdf-offset 12` 本地多进程 OCR 转成**带 PDF 页码 + 原书印刷页码双锚点**的 Markdown 存入 `raw/books/` 并自动登记快照；
-2. 平时让 Agent 带着研究问题读 Markdown 做卡片，强制保留原书页码与原话；
-3. 真正要把某句原话加双引号写进论文时，跑 `python3 tools/verify-pdf-quote.py "/path/to/book.pdf" --book-page 25 --pdf-offset 12` 单独导出原书那一页的高清扫描图看一眼，100% 防住“权利/权力”“己/已”“间/问”等形近/同音错字。
-👉 **8 套主流工具在 Apple Silicon 上的真书实测对比表与一键安装步骤见：[docs/scanned-pdf-ocr-guide.md](./docs/scanned-pdf-ocr-guide.md)**。
+### 4. 扫描版 / 纯图片 PDF 专著一句话入库（Mac & Windows 零成本本地转换）
+针对内嵌文字层为 0 的中英文扫描版电子书或论文，挂载 `skills/scanned-pdf-to-markdown` 后，**无需去终端手敲长串命令**，直接在 Claude Code / Codex / WorkBuddy / Antigravity 对话中说一句话：
+> `把 "/path/to/扫描版书.pdf" 转成带页码的 Markdown 存进 brain/raw/books/`
+
+Agent 会自动按四步协议完成：
+1. **首次自动装好本地免费模型**（`MinerU 4.2` 轻量 ONNX，`0` 元 API 费、`0` 大模型 Token，转换质量与所选 Agent 模型贵贱完全无关）；
+2. **1 秒预估耗时**：短篇（≤1 分钟）直接出结果；长篇专著先报预估分钟数，获准后作为**后台子任务**执行，不阻塞当前对话；
+3. **带双页码落盘 + 自动断点续传**：自动存入 `raw/books/<书名>.md`，每页保留 `PDF p.X | 原书 p.Y` 双页码锚点与表格/注文，每 25 页独立存档，中断重跑秒级续传；
+4. **确定性自动验收并通知**：逐页核对 `1..N` 页无漏页后主动回报路径与耗时。
+👉 **8 套工具横评 + Mac M5 Pro 与 Windows i7-1260P 轻薄本双真机实测速度/质量表见：[docs/scanned-pdf-ocr-guide.md](./docs/scanned-pdf-ocr-guide.md)**。
 
 ---
 

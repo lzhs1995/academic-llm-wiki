@@ -1,107 +1,102 @@
-# 扫描版中英文学术书籍入库与防错直引指南（Apple Silicon 实测版）
+# 扫描版中英文 PDF 转带页码 Markdown 实测指南（Mac & Windows 双端实测版）
 
-针对人文社科研究中大量存在的**纯图片扫描版 PDF 专著/古籍/论文**（内嵌文字层为 `0` 字符），本仓库内置了经中英文真实扫描专著同场实测筛选出的最优本地流水线：
-
-1. **一次性离线转写**：`tools/ingest-scanned-pdf.py`（基于 `MinerU 4.2+` ONNX + `middle_json` 逐页重组），将纯图像 PDF 多进程并发转换为**同时保留 PDF 物理页码、OCR 原书印刷页码、章节页眉、无框线表格与独立注文**的 Markdown（存入 `raw/books/`），并自动在 `sources/manifest.json` 登记原 PDF 的 `SHA-256` 不可变指纹。
-2. **带着问题定向抽卡**：让 Claude Code / Codex / WorkBuddy / Antigravity 阅读 `raw/books/<书名>.md` 相关章节，提炼结构化卡片写入 `wiki/`，**强制绑定原书页码、PDF 物理页码与快照精确行号**（`lines:START-END`）。
-3. **双引号直引单页原图终核**：凡拟加双引号直接写进论文的正文引语，调用 `tools/verify-pdf-quote.py` 秒级导出原扫描 PDF 对应单页高清 PNG，由人工或 Agent 多模态视觉逐字核对字形，彻底防住 OCR 同音/形近错字（如中文“权利/权力”“己/已”“世代间/世代问”“拨/拔”，或 19 世纪英文断墨字符）。
+面向搭建 **LLM-Wiki（Obsidian + Agent）** 的研究者，遇到内嵌文字层为 `0` 字符的**纯图片/扫描版 PDF 书籍或论文**时，第一步的核心需求只有五件事：
+1. **默认保留双页码**（`PDF p.X | 原书 p.Y`），方便后续论文引用溯源；
+2. **默认纯本地免费模型转换**（`0` 元 API 费、`0` 大模型 Token）；
+3. **默认在 Agent 对话里一句话触发**（通过 `scanned-pdf-to-markdown` Skill 自动执行，不用去终端敲一长串复杂参数）；
+4. **默认存入 Obsidian 的 `brain/raw/books/` 且支持中断秒级断点续传**；
+5. **默认先 1 秒预估耗时**：短篇（≤1 分钟）直接出结果；长篇专著先报预估分钟数，获准后作为后台子任务运行并在完成后主动通知。
 
 ---
 
-## 一、8 套方案真实扫描书同场实测对比（Apple Silicon M5 Pro）
+## 一、为什么上游 `MinerU` 原项目外还需要包一层薄 Skill？
 
-测试样本：
-- **中文纯扫描专著**：20 世纪社会学经典合集（545 页，`0` 内嵌字符，约 180 DPI 灰度扫描，含脚注与大量形近词）
-- **英文纯扫描古籍**：1884 年版 18 世纪英国工业革命讲义（390 页，`0` 内嵌字符，600 DPI CCITT 二值传真扫描，含无框线历史人口统计表、双栏小字脚注与断墨衬线体）
+直接核查上游 `opendatalab/MinerU` 官方仓库及其自带的 `skills/mineru/SKILL.md` 后，实测发现原版 CLI 与官方 Skill 不能直接开箱满足知识库入库需求：
 
-| 参评工具 / 方案 | GitHub 星标（实核） | 开源许可 | 纯扫描中文准确率（12项形近/生僻词探针） | 纯扫描古英文准确率（11项统计/断墨/注文探针） | M5 Pro 实测纯推理速度 | 无框线表格与注文分离 | 原书页码锚点 | 实测结论与踩坑真相 |
+| 痛点维度 | 上游 `MinerU` 原版 CLI / 官方 Skill | 本仓库 `scanned-pdf-to-markdown` Skill (`pdf2md.py`) |
+|---|---|---|
+| **页码保留** | `mineru-kit parse -o book.md` 默认**删光全部页码**拼成无页码长文（实测 `has_page_markers: false`）；官方 Skill 仅每次临时读 10 页 JSON，不落盘全书 Markdown | 逐页解析 `middle_json`，每页自动生成机器注释与可读双页头：`### [PDF p.37 \| 原书 p.25 · 差序格局]` |
+| **耗时预估与后台派发** | 无预估机制，直接前台阻塞数十分钟 | `estimate` 子命令 1 秒返回页数、断点进度与预计分钟数；`>1 分钟` 先询问后转后台子任务 |
+| **断点续传** | 中途断电或中断需整本重跑 | 每 25 页原子落盘 JSON 缓存，中断后重跑在 `~1.3 秒` 内跳过已完成分片 |
+| **防卡死内存保护** | 手动多开进程在空闲内存不足时会打爆 macOS / Windows 虚拟内存引发数倍降速 | `doctor` 自动检测实时可用物理内存，Mac / Windows 按平台动态选择并发度 |
+| **为什么选 Skill 不选 MCP** | — | MCP 需常驻后台进程且每轮对话白占上下文 Token；`Skill + 单文件标准库脚本` 平时 `0` 内存 `0` Token，且 Claude Code / Codex / WorkBuddy / Antigravity 原生通用 |
+
+---
+
+## 二、Mac 高配本 vs Windows 16G 轻薄本 真机实测数据一览
+
+测试样本（均为内嵌文字层 `0` 字符的纯扫描 PDF）：
+- **中文扫描专著**：20 世纪社会学经典合集（**545 页**，`38.6 MB`，约 180 DPI 灰度扫描，含脚注与大量形近词）
+- **英文扫描古籍**：1884 年版英国工业革命讲义（**390 页**，`43.0 MB`，600 DPI CCITT 传真二值扫描，含无框线历史人口统计表与双栏小字注文）
+
+### 1. 双平台真机硬件与转换耗时对照表
+
+| 实测指标 | Mac 高配本（Apple M5 Pro · 15核 · 48GB） | Windows 主流轻薄本（Intel i7-1260P · 12核16线程 · 16GB · Iris Xe） |
+|---|---|---|
+| **底层加速引擎** | `ONNX Runtime` ARM64 CPU | `onnxruntime-directml 1.24.4`（无重型 PyTorch 依赖） |
+| **首次环境安装耗时** | Python 包约 `25 秒` + 模型 `805 MB`（一次性） | 清华镜像安装 118 个包实测 **`39.6 秒`** + 模型 `805 MB`（一次性） |
+| **单并发速度（`workers=1`，后台极低占用）** | 中文 **`6.17 秒/页`** · 英文 **`7.66 秒/页`** | 中文 **`11.49 秒/页`** · 英文 **`11.88 秒/页`** |
+| **双并发速度（`workers=2`，日常推荐档）** | 约 **`3.5–4.0 秒/页`**（需空闲内存 `≥8 GB`） | 实测 **`5.80 秒/页`**（仅需空闲内存 `≥5.5 GB`，提速 **1.98 倍**） |
+| **高并发满血档（空闲内存充裕时）** | 5 并发约 **`1.6–2.0 秒/页`** | 3 并发约 **`4.3 秒/页`**（需空闲内存 `≥10 GB`） |
+| **转一篇 20 页扫描论文耗时** | 约 **`1.2–2.0 分钟`** | **`1.9 分钟`**（双并发实测 `116.0 秒`）/ 单并发 `3.8 分钟` |
+| **转完 390 页英文扫描全书耗时** | 约 **`25 分钟`**（双并发）/ 满血约 `13 分钟` | 约 **`38 分钟`**（双并发）/ 单并发约 `77 分钟` |
+| **转完 545 页中文扫描全书耗时** | 约 **`32 分钟`**（双并发）/ 满血约 `16 分钟` | 约 **`53 分钟`**（双并发）/ 单并发约 `104 分钟` |
+| **中断后断点续传重扫耗时（20页已缓存）** | **`< 1.0 秒`** | 实测 **`1.26 秒`**（`0` 页重算） |
+| **API 费用 / 大模型 Token 消耗** | **`0 元` / `0 Token`** | **`0 元` / `0 Token`** |
+| **中英质量探针得分（23项形近词/古籍表）** | 中文 **`11/12`** · 英文 **`9/11`** · 表格完整 · 双页码 `100%` | 中文 **`11/12`** · 英文 **`9/11`** · 表格完整 · 双页码 **`100%` 完全一致** |
+
+---
+
+## 三、低智力 / 超低价模型（Flash / Lite / Haiku 级）盲测结论
+
+针对用户关心的核心问题：**“如果在 Claude Code / WorkBuddy 里换成 DeepSeek Flash、Haiku 或本地轻量小模型，能不能独立跑通安装、预估、执行、验收？会不会降低转换质量？”**
+
+我们在真实环境中启动最低档轻量模型（`flash_lite`）仅凭一句自然语言口令进行了全链路盲测：
+1. **对转换正文质量的影响 = `0%`（绝对零差异）**：PDF 页面识别、无框线表格还原、原书页码提取与 Markdown 拼装 100% 由本地 `MinerU ONNX` 模型与确定性 Python 代码完成，大模型完全不触碰书本正文。实测最低档轻量模型产出的页面正文与顶配旗舰模型 **字节级 100% 一致（`EXACT_BYTE_MATCH: True`）**。
+2. **对执行与验收成功率的影响 = `100%` 零报错跑通**：因为排坑逻辑（国内 `ModelScope` / 镜像自动切换、空闲内存并发保护、25 页断点缓存、`1..N` 漏页硬校验）已全部封装进 `pdf2md.py` 的 `doctor → estimate → convert → verify` 四个傻瓜式 JSON 子命令，便宜模型整趟只需消耗约 `1k–2k` 调度 Token（折合人民币不到 **1 分钱**）即可稳稳交付。
+
+---
+
+## 四、8 套主流工具同场横评真相（为什么最终只留 `MinerU 4.2 ONNX`）
+
+| 参评工具 / 方案 | GitHub 星标 | 开源许可 | 纯扫描中文（12项） | 纯扫描古英文（11项） | M5 Pro 单进程速度 | 表格与注文分离 | 原书页码提取 | 实测踩坑真相 |
 |---|---|---|---|---|---|---|---|---|
-| **`MinerU 4.2`（`basic` ONNX + `middle_json` 封装）** | `83.9k` | AGPL-3.0 衍生 | **`11/12`（最优）** | **`10/11`（长行零乱码）** | 单进程 `6.2–7.7s/页`<br/>**5 进程并发约 `1.6–2.0s/页`** | **极强**（无框线表转 `<table>`；注文标 `page_footnote`） | **原生提取印刷页码** + PDF 页码 | **🏆 综合冠军（本库默认）**：无需 Java、无需后台常驻服务、中英双优、自动分离页眉与原书页码 |
-| **`Docling` 独立版（`RapidOCR --lang ch`）** | `70.7k` | MIT | `11/12` | `9/11`（600 DPI 英文宽行偶发漏识乱码） | 中 `5.4s/页`<br/>英 `11.4s/页` | 强（Markdown 表格 + 注文列表） | 支持分页占位符（不单独抽原书页码） | **MIT 许可备选**：直接调 Python 比套壳 OpenDataLoader 快 **2–3 倍**，但英文二值宽行偶发丢词 |
-| **`OpenDataLoader-PDF [Hybrid]`** | `30.3k` | Apache-2.0 | `11/12` | `9/11`（底层即 Docling，同现英文宽行乱码） | **中 `16.5s/页`<br/>英 `15.1s/页`** | 强（底层调 `docling-fast`） | 支持 `%page-number%` 分隔符（仅 PDF 页码） | **被公开跑分高估**：本地模式（`0.015s/页`）对纯扫描版提取为 **0 字**；混合模式实为 Java 调本地 Docling HTTP 服务，纯扫描书比宣称的 `0.46s/页` **慢约 35 倍**，且官方 `--help` 的 `english,chinese` 参数会静默忽略中文 |
-| **`RapidOCR (PP-OCRv6) + pypdfium2` 直通** | — | Apache-2.0 | `11/12` | `9/11`（宽行偶发乱码） | 单进程 `2.6–3.3s/页`（零额外模型下载） | **无**（无框线表格被打散成竖列） | 仅 PDF 页码 | **超轻量备选**：仅 50MB 轮子开箱即跑，适合纯文字无表格的中文扫描件快速初筛 |
-| **`OCRmyPDF + MarkItDown`** | `35.3k` / `196.2k` | MPL-2.0 / MIT | `4/12`（中文惨败） | `10/11` | 8 核并发 `2.2–2.7s/页` | 弱（页眉与跨页脚注易混入正文） | 无原生分页标记 | 底层基于 Tesseract，英文稳但中文形近错字极多（如“愚和病→思和病”“阖第→国第”），缺中文字体时还会生成两倍体积的透明层 PDF |
-| **`Tesseract CLI` + `pdftoppm`** | — | Apache-2.0 | `4/12` | **`11/11`** | 中 `12.0s/页`<br/>英 `3.1s/页` | 无（页眉脚注混入段落） | 仅脚本外层拼接 PDF 页码 | 纯英文老文献单页识别稳，但中文扫描书不可用 |
-| **Mac 原生 `Vision / ocrmac`** | `555` | MIT / 系统内置 | 沙盒受阻 | 沙盒受阻 | — | 无 | 仅外层拼接 | **Agent 沙盒真坑**：在 Claude Code / Codex / Antigravity 的受限子进程沙盒中会触发 `CVPixelBuffer -6662` 硬件缓冲报错；且苹果 `PDFKit` 解码老式 CCITT 扫描流会直接渲染出空白页 |
-| **`MarkItDown` 直读 / `OpenDataLoader` 本地模式** | `196.2k` / `30.3k` | MIT / Apache-2.0 | **`0/12`（0 字）** | **`0/11`（0 字）** | `<0.2s/页` | — | — | **仅适合自带文字层的数字原生 PDF / Word / PPT**，对纯图片扫描书完全无效 |
-| **`Marker 2.2`（`surya-ocr`）** | `41.0k` | Apache-2.0 代码 + 权重限制 | 首次运行强依赖拉取数 GB Surya 权重 | 同左 | CPU 极慢（官方基准 `~53.9s/页`） | 强（公式转 LaTeX 好） | 支持 JSON 分页 | 适合有独立显卡且大量数学公式的英文理工科 PDF；社科纯文字/表格扫描书在无独显或弱代理环境下性价比低 |
+| **`MinerU 4.2`（`basic` ONNX + `pdf2md.py`）** | `83.9k` | AGPL-3.0 衍生 | **`11/12`** | **`9~10/11`** | `6.2–7.7s/页` | **极强**（无框线表转 `<table>`） | **PDF页码 + 原书页码** | **🏆 综合冠军**：跨 Mac/Windows 一致、无需 Java、无需常驻后台服务 |
+| **`Docling` 独立版（`RapidOCR`）** | `70.7k` | MIT | `11/12` | `9/11` | 中 `5.4s/页` · 英 `11.4s/页` | 强 | 仅分页符 | MIT 备选，但 600 DPI 英文宽行偶发漏识 |
+| **`OpenDataLoader-PDF [Hybrid]`** | `30.3k` | Apache-2.0 | `11/12` | `9/11` | **中 `16.5s/页` · 英 `15.1s/页`** | 强（底层即 Docling） | 仅 PDF 页码 | 本地模式（`0.015s/页`）对扫描件提取为 **0 字**；混合模式需装 Java + 常驻 HTTP 服务，比宣传慢约 35 倍 |
+| **`RapidOCR (PP-OCRv6)` 直通** | — | Apache-2.0 | `11/12` | `9/11` | `2.6–3.3s/页` | **无**（表格被打散） | 仅 PDF 页码 | 适合无表格纯文字扫描件快速初筛 |
+| **`OCRmyPDF + MarkItDown`** | `35.3k` / `196.2k` | MPL / MIT | `4/12`（中文惨败） | `10/11` | 8核 `2.2–2.7s/页` | 弱 | 无分页标记 | 中文形近错字极多（如“愚和病→思和病”） |
+| **`Tesseract CLI`** | — | Apache-2.0 | `4/12` | **`11/11`** | 中 `12.0s/页` · 英 `3.1s/页` | 无 | 仅外层拼页码 | 纯英文老文献稳，中文不可用 |
+| **Mac 原生 `Vision / ocrmac`** | `555` | MIT | 沙盒报错 | 沙盒报错 | — | 无 | — | 在 Agent 子进程沙盒内易触发 `CVPixelBuffer -6662`，且 `PDFKit` 解码老 CCITT 扫描流会出空白页 |
+| **`MarkItDown` 直读** | `196.2k` | MIT | **`0/12`（0 字）** | **`0/11`（0 字）** | `<0.01s/页` | — | — | **仅支持自带文字层的原生电子文档**，对扫描件完全无效 |
 
 ---
 
-## 二、一次性环境安装（仅需做一次，约 5 分钟）
+## 五、使用方法（一句话全自动）
 
-在终端（推荐使用 `uv` 隔离安装，不污染系统 Python）：
-
-```bash
-# 1. 安装 poppler（供单页高清原图核验使用）与 uv
-brew install poppler uv
-
-# 2. 创建独立 MinerU 运行环境
-mkdir -p ~/.local/share/research-vault
-uv venv ~/.local/share/research-vault/mineru-venv --python 3.12
-uv pip install --python ~/.local/share/research-vault/mineru-venv/bin/python "mineru>=4.2,<5"
-
-# 3. 预下载轻量 ONNX 模型（约 805 MB；国内无代理走 modelscope，挂海外代理建议先卸载 hf-xet 走 huggingface）
-uv pip uninstall --python ~/.local/share/research-vault/mineru-venv/bin/python hf-xet
-~/.local/share/research-vault/mineru-venv/bin/mineru-kit models download --tier basic --source modelscope -v
-```
-
-> **提示**：一旦 `~/.mineru/models/MinerU-4_models_onnx` 下载完成，`tools/ingest-scanned-pdf.py` 会自动开启 `HF_HUB_OFFLINE=1` 纯离线高速运行，后续转书完全不联网。
-
----
-
-## 三、日常标准三步工作流
-
-### 第 1 步：把扫描版 PDF 一键转成带双页码锚点的 Markdown 并登记快照
-
-```bash
-cd ~/Documents/brain
-
-# --pdf-offset 填“正文第1页所在的PDF页码减1”（例如原书第1页在PDF第13页，就填 12）
-python3 tools/ingest-scanned-pdf.py \
-  "/绝对路径/某某扫描书.pdf" \
-  --slug "作者_年份_书名简称" \
-  --title "作者（年份）《完整书名》" \
-  --pdf-offset 12 \
-  --workers 5 \
-  --chunk-size 100
-```
-
-脚本会自动：
-- 多进程并发识别全书（支持断点续传：中途 Ctrl+C 后重跑会自动跳过已完成的页面分块）；
-- 输出 `raw/books/作者_年份_书名简称.md`，每一页均带有精确机器锚点与人类可读页头：
-  ```markdown
-  <!-- pdf_page: 172 | book_page: 160 | ocr_page: 160 | header: 第二章 双系抚育 -->
-  ### [PDF p.172 | 原书 p.160 · 第二章 双系抚育]
+### 1. 挂载 Skill（仅需一次）
+- **macOS / Linux**：
+  ```bash
+  mkdir -p ~/.agents/skills ~/.claude/skills ~/.gemini/skills
+  ln -sfn ~/Documents/brain/skills/scanned-pdf-to-markdown ~/.agents/skills/scanned-pdf-to-markdown
+  ln -sfn ~/Documents/brain/skills/scanned-pdf-to-markdown ~/.claude/skills/scanned-pdf-to-markdown
+  ln -sfn ~/Documents/brain/skills/scanned-pdf-to-markdown ~/.gemini/skills/scanned-pdf-to-markdown
   ```
-- 在 `sources/manifest.json` 与 `.source-snapshots/` 生成不可变快照（原扫描 PDF 保持只读零改动）。
+- **Windows（PowerShell）**：
+  ```powershell
+  New-Item -ItemType Directory -Force -Path "$HOME\.agents\skills", "$HOME\.claude\skills" | Out-Null
+  Copy-Item -Recurse -Force "$HOME\Documents\brain\skills\scanned-pdf-to-markdown" "$HOME\.agents\skills\"
+  Copy-Item -Recurse -Force "$HOME\Documents\brain\skills\scanned-pdf-to-markdown" "$HOME\.claude\skills\"
+  ```
 
-### 第 2 步：让 Agent 带着具体研究问题定向抽卡片（不要整本泛泛总结）
+### 2. 日常在 Agent 中一句话调用
+直接在对话框里对 Agent 说：
+> `把 "/绝对路径/某某扫描书.pdf" 转成带页码的 Markdown 放进 brain/raw/books/`
 
-在 Claude Code / Codex / WorkBuddy / Antigravity 中直接下达口令：
+输出格式示例（位于 `~/Documents/brain/raw/books/某某扫描书.md`）：
+```markdown
+<!-- pdf_page: 37 | book_page: 25 | ocr_page: 25 | header: 差序格局 -->
+### [PDF p.37 | 原书 p.25 · 差序格局]
 
-> `请读 raw/books/作者_年份_书名简称.md 中与【你的具体研究问题，如：双系抚育与单系偏重的张力】相关的章节，在 wiki/research/ 下新建一张概念/文献对话卡，强制写明 PDF 页码、原书页码及逐字原话（绑定 manifest 版本与精确 lines 行号），并跑通 python3 tools/wiki-lint.py --strict。`
-
-### 第 3 步：论文正式加双引号直引前，单页原图视觉防错复核
-
-当你要把卡片里的某句原话加双引号写进正式论文时，对 Agent 说一句话（或手动运行）：
-
-```bash
-python3 tools/verify-pdf-quote.py "/绝对路径/某某扫描书.pdf" --book-page 25 --pdf-offset 12
+我们的格局不是一捆一捆扎清楚的柴，而是好像把一块石头丢在水面上所发生的一圈圈推出去的波纹。每个人都是他社会影响所推出去的圈子的中心。
 ```
-
-该命令会在 0.3 秒内把原扫描 PDF 对应那一页导出为 250 DPI 高清图片（存放在 `.vault-meta/quote-renders/`），让 Agent 直接看一眼原书字形图片，100% 拦截“以**己**为中心 → 以**已**为中心”“**拨**拨清楚 → **拔**拔清楚”“**权**利 → **权**力”等一切 OCR 残余形近错字。
-
----
-
-## 四、Token 成本拆解与「便宜/本地模型」四级分工策略
-
-日常维护扫描书卡片**绝不应该让昂贵的旗舰大模型硬啃整本原书**。按以下四道工序切分后，单本 500 页专著入库与制卡成本可降低 **95% 以上**：
-
-| 工序 | 动作 | 大模型 Token 消耗 | 推荐模型档位 | 硬件与质量边界 |
-|---|---|---|---|---|
-| **① 扫描 PDF 转 Markdown + 登记指纹** | `python3 tools/ingest-scanned-pdf.py` | **`0` Token** | **无需任何 LLM**（纯本地 Python + ONNX） | 本机空闲内存 <14 GiB 时脚本自动限流 `--workers 2 --chunk-size 32`，防止触发 macOS Swap 换页 |
-| **② 按问题查章节、提炼初稿卡片** | 先 `grep` 标题定位页码，**每次仅读取 10–25 页**（严禁整本几十万字全塞进上下文） | 约 `10k–20k` Input + `1.5k` Output | **超低价云模型**（`DeepSeek Flash` / `Haiku` / `GPT Flash/Mini`）或**本机 `Gemma 4`** | 结构化摘录与跑 `wiki-lint.py --strict` 对便宜模型毫无压力；若跑本地大模型请避开 OCR 高峰期以免争抢统一内存 |
-| **③ 论文双引号直引前的单页原图核字** | `python3 tools/verify-pdf-quote.py` 导出单页 PNG 对照字形 | 约 `1.5k` 图像 Input + `200` Output | **高分中文视觉多模态模型**（`Haiku` / `GPT` 视觉轻量版 / `Gemma 4 Vision`）或**人眼扫视 3 秒** | 纯文本模型无法看图；针对扫描模糊处的“己/已”等一笔之差，多模态初审 + 人工扫一眼 PNG 是零失误双保险 |
-| **④ 跨文献理论对话与论文正文润色** | 仅读取 `wiki/` 中提炼完毕的 3–6 张卡片（共 `3k–6k` tokens） | 约 `5k–12k` Input + `2k` Output | **旗舰主力模型**（`Claude Opus/Sonnet` / `GPT Pro`） | 旗舰模型只读浓缩卡片写引言或改稿，既省钱又彻底规避超长上下文注意力衰减 |
-
