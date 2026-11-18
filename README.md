@@ -56,10 +56,14 @@ academic-llm-wiki/
 │   ├── wiki-lint.py                 # 全库体检：双链/锚点 + YAML 契约 + Bases 过滤 + 引文联检
 │   ├── quote-check.py               # 逐字引文与来源版本一致性核验（防模型编造引文）
 │   ├── source_registry.py           # 来源指纹登记与定位切片核对
+│   ├── ingest-scanned-pdf.py        # 扫描版中英文 PDF 多进程 OCR 转双页码锚点 Markdown 并登记快照
+│   ├── verify-pdf-quote.py          # 论文双引号直引前秒级导出原扫描 PDF 单页高清 PNG 供字形终核
 │   ├── research-watch.py            # 官网更新定时巡检 + 任务收尾候选入队（无 LLM 调用）
 │   ├── research-commit.py           # 多 Agent 并发安全的精确文件白名单 Git 提交器
 │   ├── build-research-nav.py        # 从卡片属性自动同步 wiki/index.md 路由目录
 │   └── launchd/                     # macOS 每日 10:00 自动巡检 LaunchAgent 模板
+├── docs/
+│   └── scanned-pdf-ocr-guide.md     # 8 款扫描 PDF 转 Markdown 工具真书实测横评与三步操作手册
 └── tests/                           # 确定性工具链单元测试套件
 ```
 
@@ -89,6 +93,13 @@ ln -sfn ~/Documents/brain/skills/research-vault ~/.gemini/skills/research-vault
 
 ### 3. （可选）启用每日早上 10:00 自动检查 CHARLS / CFPS 官网更新（macOS）
 将 `tools/launchd/com.example.research-vault-watch.plist` 中的 `/ABSOLUTE/PATH/TO/brain` 替换为你的实际绝对路径，拷入 `~/Library/LaunchAgents/` 后加载。一旦官网页面发生更新，会自动写入 `.vault-meta/research-inbox/items/` 待办队列，下次开研究任务时提醒你查新。
+
+### 4. 扫描版 / 纯图片 PDF 专著入库与双引号直引防错
+针对内嵌文字层为 0 的中英文扫描版电子书，切勿直接把整本百兆扫描 PDF 塞给大模型硬啃，也不要依赖只支持原生文字层的 `MarkItDown`：
+1. 先用 `python3 tools/ingest-scanned-pdf.py "/path/to/book.pdf" --pdf-offset 12` 本地多进程 OCR 转成**带 PDF 页码 + 原书印刷页码双锚点**的 Markdown 存入 `raw/books/` 并自动登记快照；
+2. 平时让 Agent 带着研究问题读 Markdown 做卡片，强制保留原书页码与原话；
+3. 真正要把某句原话加双引号写进论文时，跑 `python3 tools/verify-pdf-quote.py "/path/to/book.pdf" --book-page 25 --pdf-offset 12` 单独导出原书那一页的高清扫描图看一眼，100% 防住“权利/权力”“己/已”“间/问”等形近/同音错字。
+👉 **8 套主流工具在 Apple Silicon 上的真书实测对比表与一键安装步骤见：[docs/scanned-pdf-ocr-guide.md](./docs/scanned-pdf-ocr-guide.md)**。
 
 ---
 
