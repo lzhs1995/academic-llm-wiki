@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
 
-SKILL_SCRIPT = Path(__file__).resolve().parent.parent / "skills" / "scanned-pdf-to-markdown" / "scripts" / "pdf2md.py"
+SKILL_SCRIPT = Path(os.environ.get("PDF2MD_SCRIPT") or
+                    Path(__file__).resolve().parent.parent / "skills" / "scanned-pdf-to-markdown" / "scripts" / "pdf2md.py")
 
 
 def _load_pdf2md():
@@ -77,6 +79,81 @@ class TestPdf2MdSkill(unittest.TestCase):
         self.assertEqual(by_pdf[361], "319")
         self.assertEqual(by_pdf[373], "back-11")
         self.assertEqual(by_pdf[390], "unnumbered")
+
+    @staticmethod
+    def _pages(spec):
+        """spec: {pdf_page: ocr page-number text or None}"""
+        return [{"pdf_page": p, "ocr_page": t, "page_num_candidates": [t] if t else [], "header": None}
+                for p, t in sorted(spec.items())]
+
+    def test_excerpt_whose_first_pdf_page_is_printed_231(self):
+        # Journal article / book chapter excerpt: printed numbers are larger than PDF page numbers.
+        pages = self._pages({1: "231", 2: "232", 3: None, 4: "234", 5: "235"})
+        info = pdf2md.infer_pagination(pages)
+        self.assertEqual(info["body_offset"], -230)
+        self.assertEqual([pg["book_page"] for pg in pages], ["231", "232", "233", "234", "235"])
+        self.assertEqual(pages[2]["book_page_basis"], "inferred")
+
+    def test_single_page_excerpt_keeps_its_printed_number(self):
+        pages = self._pages({1: "25"})
+        pdf2md.infer_pagination(pages)
+        self.assertEqual(pages[0]["book_page"], "25")
+        self.assertEqual(pages[0]["book_page_basis"], "printed")
+
+    def test_unnumbered_plates_mid_book_shift_the_offset(self):
+        # pdf 5..24 = p.1..20, pdf 25..28 = 4 unnumbered plates, pdf 29..60 = p.21..52
+        spec = {p: str(p - 4) for p in range(5, 25)}
+        spec.update({p: None for p in range(25, 29)})
+        spec.update({p: str(p - 8) for p in range(29, 61)})
+        pages = self._pages(spec)
+        pdf2md.infer_pagination(pages)
+        by = {pg["pdf_page"]: pg["book_page"] for pg in pages}
+        self.assertEqual(by[24], "20")
+        self.assertEqual([by[p] for p in range(25, 29)], ["unnumbered"] * 4)
+        self.assertEqual(by[29], "21")
+        self.assertEqual(by[60], "52")
+
+    def test_isolated_misread_is_corrected_not_trusted(self):
+        # Fei pdf 112: OCR read '1' on a section opening; neighbours say offset 12 -> p.100
+        spec = {p: str(p - 12) for p in range(100, 125)}
+        spec[112] = "1"
+        pages = self._pages(spec)
+        pdf2md.infer_pagination(pages)
+        pg = next(x for x in pages if x["pdf_page"] == 112)
+        self.assertEqual((pg["book_page"], pg["book_page_basis"]), ("100", "corrected"))
+
+    def test_edge_pages_marked_extrapolated_and_verify_reports_breaks(self):
+        spec = {1: None, 2: None, 3: None, 4: None}
+        spec.update({p: str(p - 2) for p in range(5, 40)})  # pdf 3,4 = p.1,2 without printed numbers
+        pages = self._pages(spec)
+        pdf2md.infer_pagination(pages)
+        by = {pg["pdf_page"]: (pg["book_page"], pg["book_page_basis"]) for pg in pages}
+        self.assertEqual(by[2], ("unnumbered", None))
+        self.assertEqual(by[3], ("1", "extrapolated"))
+        for pg in pages:
+            pg["markdown"] = "text " * 10
+        with tempfile.TemporaryDirectory() as td:
+            md = Path(td) / "b.md"
+            md.write_text(pdf2md.format_markdown(title="T", source_pdf=Path("/x.pdf"), source_sha="0" * 64,
+                                                 total_pdf_pages=39, pdf_offset=2, tier="basic", pages=pages), encoding="utf-8")
+            self.assertIn("原书 p.1（无印刷页码，推算）", md.read_text(encoding="utf-8"))
+            ver = pdf2md.cmd_verify(md, expected_pages=39)
+            self.assertTrue(ver["ok"])
+            self.assertEqual(ver["extrapolated_pages"], [3, 4])
+            self.assertEqual(ver["numbering_breaks"], [])
+            broken = md.read_text(encoding="utf-8").replace("pdf_page: 20 | book_page: 18", "pdf_page: 20 | book_page: 19")
+            md.write_text(broken, encoding="utf-8")
+            self.assertEqual(len(pdf2md.cmd_verify(md, expected_pages=39)["numbering_breaks"]), 2)
+
+    def test_status_of_dead_process_is_interrupted(self):
+        st = {"state": "running", "host": pdf2md.socket.gethostname(), "pid": 2 ** 22 + 12345}
+        self.assertEqual(pdf2md.with_liveness(st)["state"], "interrupted")
+        self.assertEqual(pdf2md.with_liveness(dict(st, pid=pdf2md.os.getpid()))["state"], "running")
+
+    def test_status_file_is_per_vault(self):
+        a = pdf2md.status_file_for_slug("book", Path("/tmp/vault_a"))
+        b = pdf2md.status_file_for_slug("book", Path("/tmp/vault_b"))
+        self.assertNotEqual(a, b)
 
     def test_import_models_from_tar(self):
         import tarfile
