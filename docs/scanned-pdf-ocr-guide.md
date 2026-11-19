@@ -18,6 +18,7 @@
 | 痛点维度 | 上游 `MinerU` 原版 CLI / 官方 Skill | 本仓库 `scanned-pdf-to-markdown` Skill (`v2.0`) |
 |---|---|---|
 | **页码保留与纠错** | `mineru-kit parse -o book.md` 默认**删光全部页码**（【实测】`has_page_markers: false`）；若直接信单页 OCR 页码，古籍装订字母 `B/P/Q` 与 `121→12I` 会产生每本十余页错标 | 全书众数自动推算 `PDF页码 - 原书页码` 固定差值（并识别罗马数字前言与书末附页），单页 OCR 仅作交叉核对，【实测】自动拦截修正 Toynbee 全书 `15` 处页码误识 |
+| **表格与插图/统计图分流** | `middle_json` 对 PDF 默认剥离 `image_base64`（见 `mineru/parser/base.py`），直接渲染会丢弃插图；而开启重型 `advanced` VLM 转述图表易幻觉且极慢（见官方 Issue `#5708` / `#5728`） | **表格（`table`）**直接转结构化 Markdown / HTML `<table>`；**插图与数据图（`image` / `chart`）**版面隔离不扫乱码，按 `bbox` 自动从原 PDF 裁出 200 DPI 高清 `.png` 存入 `raw/books/assets/<书名>/` 并内嵌 `![](assets/...)` 链接 |
 | **耗时预估与高负载感知** | 无预估，前台阻塞数十分钟 | `estimate` 自动读取本机历史实测中位数（`rates.jsonl`）并检测系统 `load average`；运行中可调 `status` 查看按已完成分块计算的实时剩余时间 |
 | **完成通知与只读保护** | 无系统通知；生成文件可被模型随意改写 | 内置 macOS `osascript` / Windows 托盘气泡系统级完成通知；生成 `.md` 自动加 `0444` 只读保护锁 |
 | **断点续传与防爆内存** | 中断需重跑；手动多开易打爆虚拟内存 | 每 25 页原子落盘缓存（【实测】20 页缓存重跑仅 `1.26 秒`）；按平台空闲物理内存动态限制并发进程数 |

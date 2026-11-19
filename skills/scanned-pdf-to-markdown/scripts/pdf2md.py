@@ -9,9 +9,11 @@ Subcommands (designed so even lightweight/cheap Agent models execute 100% determ
   status    Progress / live ETA / result of a running or finished convert (reads status.json)
   verify    Deterministic check of page completeness, modal page-label validity, read-only protection and output SHA-256
 
-Book page labels (原书页码) are computed from the modal PDF->print offset detected across the book
-(plus Roman frontmatter and optional publisher backmatter sequences); single-page OCR page numbers
-are used only as votes and cross-checks, preventing misreads like '12I', 'III', 'B', or '福'.
+Book page labels (原书页码) come from runs of pages that share one PDF->print offset (Roman front matter,
+the body, a catalogue that restarts at 1, an excerpt starting at p.231, unnumbered plates mid-book).
+The number OCR'd on a single page is only a vote and a cross-check, so misreads like '12I', 'III',
+'B' or '福' do not become page labels. Each marker says how its label was obtained (basis: printed /
+corrected / inferred / extrapolated).
 """
 from __future__ import annotations
 
@@ -36,10 +38,11 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 
-SKILL_VERSION = "2.0.0"
-OUTPUT_ENGINE_TAG = "scanned-pdf-to-markdown/2.0.0"
+SKILL_VERSION = "2.2.0"
+OUTPUT_ENGINE_TAG = f"scanned-pdf-to-markdown/{SKILL_VERSION}"
 
 ROMAN_RE = re.compile(
     r"^(?=[mdclxvi]+$)m{0,3}(cm|cd|d?c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})$",
@@ -276,122 +279,171 @@ def extract_clean_arabic(raw: str | None) -> int | None:
     return None
 
 
-def infer_pagination(pages: list[dict], explicit_offset: int | None = None) -> dict:
-    """Assign accurate `book_page` labels across `pages` using modal PDF->print offset + Roman frontmatter."""
-    if not pages:
-        return {"body_offset": explicit_offset, "roman_offset": None, "back_offset": None, "ocr_divergences": []}
+def _page_number_vote(pg: dict) -> tuple[str, int, str] | None:
+    """One (kind, value, raw_token) vote per page: arabic from page-number blocks, then numeric header
+    parts; Roman only when no arabic number was read on the page."""
+    cands = list(pg.get("page_num_candidates") or ([pg["ocr_page"]] if pg.get("ocr_page") else []))
+    header_parts = [h.strip() for h in (pg.get("header") or "").split(" | ") if h.strip()]
+    for tok in cands + header_parts:
+        val = extract_clean_arabic(tok)
+        if val is not None:
+            return "arabic", val, tok
+    roman_tokens = list(cands)
+    for h in header_parts:
+        roman_tokens.extend(t for t in re.split(r"[\s·.,;]+", h) if t)
+    for tok in roman_tokens:
+        rv = roman_to_int(tok)
+        if rv is not None and 1 <= rv <= 60:
+            return "roman", rv, tok
+    return None
 
-    arabic_votes: list[tuple[int, int]] = []
-    for pg in pages:
-        pdf_p = pg["pdf_page"]
-        # Prefer dedicated page_number/number blocks over generic footers
-        cands = pg.get("page_num_candidates") or ([pg["ocr_page"]] if pg.get("ocr_page") else [])
-        for tok in cands:
-            val = extract_clean_arabic(tok)
-            if val is not None and pdf_p - val >= 0:
-                arabic_votes.append((pdf_p, val))
+
+def _build_segments(votes: list[tuple[int, str, int]]) -> list[dict]:
+    """Group votes (pdf_page, kind, offset) into runs of one consistent offset, in PDF order.
+
+    A misread page number gives an offset that no neighbouring page shares, so it is dropped as noise.
+    A real change of offset (unnumbered plates inside the book, a catalogue that restarts at 1, an
+    excerpt whose first PDF page is printed p.231) is a run supported by several pages."""
+    if not votes:
+        return []
+    totals = collections.Counter((kind, off) for _, kind, off in votes)
+    min_support = 3 if max(totals.values()) >= 3 else 1
+    runs: list[dict] = []
+    for pdf_p, kind, off in sorted(votes):
+        if totals[(kind, off)] < min_support:
+            continue
+        if runs and runs[-1]["key"] == (kind, off):
+            runs[-1]["end"] = pdf_p
+            runs[-1]["support"] += 1
+        else:
+            runs.append({"key": (kind, off), "start": pdf_p, "end": pdf_p, "support": 1})
+    # Drop short runs sandwiched inside a longer run of one other offset (A x A -> A).
+    changed = True
+    while changed:
+        changed = False
+        for i in range(1, len(runs) - 1):
+            a, x, b = runs[i - 1], runs[i], runs[i + 1]
+            if a["key"] == b["key"] != x["key"] and x["support"] < 3 and x["support"] < min(a["support"], b["support"]):
+                a["end"] = b["end"]
+                a["support"] += b["support"]
+                del runs[i:i + 2]
+                changed = True
                 break
+    return [{"kind": r["key"][0], "offset": r["key"][1], "start": r["start"], "end": r["end"], "support": r["support"]} for r in runs]
 
-    body_offset: int | None = explicit_offset
-    body_start = 10**9
-    body_end = -1
-    back_offset: int | None = None
-    back_start = 10**9
-    back_end = -1
+
+def infer_pagination(pages: list[dict], explicit_offset: int | None = None) -> dict:
+    """Assign `book_page` to every page from offset segments; single-page OCR numbers are only votes.
+
+    Labels inside a segment come from its offset. Pages between segments get a label only when it
+    cannot collide with a neighbouring segment's printed numbers; pages after the last numbered page
+    stay "unnumbered". A sequence restarting below the main body's numbers after it is labelled back-N."""
+    if not pages:
+        return {"body_offset": explicit_offset, "roman_offset": None, "back_offset": None, "segments": [],
+                "ocr_divergence_count": 0, "ocr_divergences_sample": []}
+    order = sorted(pg["pdf_page"] for pg in pages)
+    by_pdf = {pg["pdf_page"]: pg for pg in pages}
+    labels: dict[int, tuple[int, int]] = {}  # pdf_page -> (segment index, printed value)
+    edge: set[int] = set()  # labelled by extending a segment past its first/last numbered page
 
     if explicit_offset is not None:
-        body_start = max(1, explicit_offset + 1)
-        matched = [pdf_p for pdf_p, val in arabic_votes if pdf_p - val == explicit_offset]
-        body_end = max(matched) if (len(pages) > 30 and matched) else max(pg["pdf_page"] for pg in pages)
-    elif arabic_votes:
-        diff_counts = collections.Counter(pdf_p - val for pdf_p, val in arabic_votes)
-        best_d, best_cnt = diff_counts.most_common(1)[0]
-        min_votes = 3 if len(pages) > 15 else 1
-        if best_cnt >= min_votes:
-            body_offset = best_d
-            matched = [pdf_p for pdf_p, val in arabic_votes if pdf_p - val == body_offset]
-            body_start = max(1, body_offset + 1)
-            if len(pages) <= 30:
-                body_end = max(pg["pdf_page"] for pg in pages)
+        segments = [{"kind": "arabic", "offset": explicit_offset, "start": order[0], "end": order[-1], "support": 0}]
+        for p in order:
+            if p - explicit_offset >= 1:
+                labels[p] = (0, p - explicit_offset)
+    else:
+        votes = []
+        for p in order:
+            v = _page_number_vote(by_pdf[p])
+            if v is not None:
+                votes.append((p, v[0], p - v[1]))
+        segments = _build_segments(votes)
+        for i, seg in enumerate(segments):
+            for p in order:
+                if seg["start"] <= p <= seg["end"] and p - seg["offset"] >= 1:
+                    labels[p] = (i, p - seg["offset"])
+
+        def last_val(seg: dict) -> int:
+            return seg["end"] - seg["offset"]
+
+        def first_val(seg: dict) -> int:
+            return seg["start"] - seg["offset"]
+
+        for i, seg in enumerate(segments):
+            prev = segments[i - 1] if i > 0 else None
+            continues = prev is not None and prev["kind"] == seg["kind"] and first_val(seg) > last_val(prev)
+            lo = prev["end"] if prev else order[0] - 1
+            # Backward from this segment's first numbered page, at most 2 pages: an unnumbered opening
+            # page (chapter start, half-title p.1 + blank p.2). Further back is guesswork.
+            for p in list(reversed([q for q in order if lo < q < seg["start"]]))[:2]:
+                val = p - seg["offset"]
+                if val < 1 or (continues and val <= last_val(prev)):
+                    break
+                labels.setdefault(p, (i, val))
+                edge.add(p)
+            # Forward from the previous segment only when the numbering simply continues.
+            if continues:
+                for p in [q for q in order if prev["end"] < q < seg["start"]]:
+                    val = p - prev["offset"]
+                    if p in labels or val >= first_val(seg):
+                        break
+                    labels[p] = (i - 1, val)
+                    edge.add(p)
+
+    arabic_idx = [i for i, s in enumerate(segments) if s["kind"] == "arabic"]
+    roman = [s for s in segments if s["kind"] == "roman"]
+    main_i = max(arabic_idx, key=lambda i: segments[i]["support"]) if arabic_idx else None
+    # Arabic segments after the main body whose numbering restarts lower (publisher catalogue, ads).
+    back_idx: set[int] = set()
+    if main_i is not None:
+        top = segments[main_i]["end"] - segments[main_i]["offset"]
+        for i in arabic_idx:
+            if i <= main_i:
+                continue
+            s = segments[i]
+            if back_idx or s["start"] - s["offset"] <= top:
+                back_idx.add(i)
             else:
-                body_end = max(matched)
-                # Detect secondary publisher catalogue / appendix restarted numbering after body_end
-                after_votes = [(pdf_p, val) for pdf_p, val in arabic_votes if pdf_p > body_end and pdf_p - val >= body_end]
-                if after_votes:
-                    back_counts = collections.Counter(pdf_p - val for pdf_p, val in after_votes)
-                    b_d, b_cnt = back_counts.most_common(1)[0]
-                    if b_cnt >= 3:
-                        back_offset = b_d
-                        back_matched = [pdf_p for pdf_p, val in after_votes if pdf_p - val == back_offset]
-                        back_start = max(body_end + 1, back_offset + 1)
-                        back_end = max(back_matched)
-
-    # Detect Roman-numeral frontmatter before body_start
-    roman_offset: int | None = None
-    roman_start = 10**9
-    roman_end = -1
-    front_limit = body_start if body_offset is not None else (max(pg["pdf_page"] for pg in pages) + 1)
-    roman_votes: list[tuple[int, int]] = []
-    single_roman_pages: dict[int, str] = {}
-
-    for pg in pages:
-        pdf_p = pg["pdf_page"]
-        if pdf_p >= front_limit:
-            continue
-        tokens: list[str] = list(pg.get("page_num_candidates") or [])
-        if pg.get("ocr_page"):
-            tokens.append(pg["ocr_page"])
-        if pg.get("header"):
-            for part in re.split(r"[|\s·.,;]+", pg["header"]):
-                if part:
-                    tokens.append(part)
-        for tok in tokens:
-            rv = roman_to_int(tok)
-            if rv is not None and 1 <= rv <= 60 and pdf_p - rv >= 0:
-                # Ignore single-letter 'I'/'i' unless corroborated by multi-page offset consensus
-                if len(tok.strip()) >= 2 and tok.strip().islower():
-                    single_roman_pages.setdefault(pdf_p, int_to_roman(rv))
-                roman_votes.append((pdf_p, rv))
-                break
-
-    if roman_votes:
-        rcounts = collections.Counter(pdf_p - rv for pdf_p, rv in roman_votes)
-        r_d, r_cnt = rcounts.most_common(1)[0]
-        if r_cnt >= 3:
-            roman_offset = r_d
-            rmatched = [pdf_p for pdf_p, rv in roman_votes if pdf_p - rv == roman_offset]
-            roman_start = max(roman_offset + 1, min(rmatched))
-            roman_end = max(rmatched)
+                top = s["end"] - s["offset"]
+    back_offset = segments[min(back_idx)]["offset"] if back_idx else None
 
     divergences: list[dict] = []
-    for pg in pages:
-        pdf_p = pg["pdf_page"]
-        raw_ocr = (pg.get("ocr_page") or "").strip()
-        label = "unnumbered"
-        if body_offset is not None and body_start <= pdf_p <= body_end:
-            calc = pdf_p - body_offset
-            if calc >= 1:
-                label = str(calc)
-                if raw_ocr and raw_ocr != label:
-                    divergences.append({"pdf_page": pdf_p, "book_page": label, "ocr_raw": raw_ocr[:40]})
-        elif back_offset is not None and back_start <= pdf_p <= back_end:
-            calc_b = pdf_p - back_offset
-            if calc_b >= 1:
-                label = f"back-{calc_b}"
-                if raw_ocr and raw_ocr != str(calc_b):
-                    divergences.append({"pdf_page": pdf_p, "book_page": label, "ocr_raw": raw_ocr[:40]})
-        elif roman_offset is not None and roman_start <= pdf_p <= roman_end:
-            calc_r = pdf_p - roman_offset
-            if 1 <= calc_r <= 60:
-                label = int_to_roman(calc_r)
-        elif pdf_p in single_roman_pages:
-            label = single_roman_pages[pdf_p]
+    basis_counts: collections.Counter = collections.Counter()
+    for p in order:
+        pg = by_pdf[p]
+        raw = (pg.get("ocr_page") or "").strip()
+        vote = _page_number_vote(pg)
+        basis = None
+        if p in labels:
+            seg_i, val = labels[p]
+            kind = segments[seg_i]["kind"]
+            label = int_to_roman(val) if kind == "roman" else (f"back-{val}" if seg_i in back_idx else str(val))
+            if vote is not None and vote[0] == kind and vote[1] == val:
+                basis = "printed"  # the number read on this page agrees
+            elif vote is not None:
+                basis = "corrected"  # a different number was read on this page; the run's offset wins
+            else:
+                basis = "extrapolated" if p in edge else "inferred"
+            agrees = basis == "printed" or not raw
+        else:
+            label = "unnumbered"
+            agrees = True
+            # A lone lowercase Roman numeral (front matter usually has too few for a segment).
+            if explicit_offset is None and len(raw) >= 2 and raw.islower() and roman_to_int(raw):
+                label = int_to_roman(roman_to_int(raw))
+                basis = "printed"
+        if raw and not agrees:
+            divergences.append({"pdf_page": p, "book_page": label, "ocr_raw": raw[:40]})
         pg["book_page"] = label
+        pg["book_page_basis"] = basis
+        basis_counts[basis or "unnumbered"] += 1
 
     return {
-        "body_offset": body_offset,
-        "roman_offset": roman_offset,
+        "body_offset": segments[main_i]["offset"] if main_i is not None else explicit_offset,
+        "roman_offset": max(roman, key=lambda s: s["support"])["offset"] if roman else None,
         "back_offset": back_offset,
+        "segments": segments,
+        "basis_counts": dict(basis_counts),
         "ocr_divergence_count": len(divergences),
         "ocr_divergences_sample": divergences[:25],
     }
@@ -490,8 +542,10 @@ def cache_dir_for(vault: Path, book_slug: str, pdf_sha: str, tier: str) -> Path:
     return vault / ".vault-meta" / "ocr-cache" / f"{book_slug}_{pdf_sha[:12]}_{tier}"
 
 
-def status_file_for_slug(book_slug: str) -> Path:
-    return state_dir() / "jobs" / f"{book_slug}.json"
+def status_file_for_slug(book_slug: str, vault: Path) -> Path:
+    """Per-vault job status (the same slug in two vaults must not share one status file)."""
+    vkey = hashlib.sha256(str(Path(vault).expanduser().resolve()).encode("utf-8")).hexdigest()[:8]
+    return state_dir() / "jobs" / f"{book_slug}__{vkey}.json"
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
@@ -534,23 +588,27 @@ def send_system_notification(title: str, message: str) -> bool:
         if sysname == "Darwin":
             safe_t = title.replace("\\", "\\\\").replace('"', '\\"')
             safe_m = message.replace("\\", "\\\\").replace('"', '\\"')
-            subprocess.run(
+            r = subprocess.run(
                 ["osascript", "-e", f'display notification "{safe_m}" with title "{safe_t}"'],
                 capture_output=True,
-                timeout=3,
+                timeout=10,
             )
-            return True
+            return r.returncode == 0
         if sysname == "Windows":
+            def ps_quote(s: str) -> str:  # single-quoted PowerShell literal: no $ expansion
+                return "'" + s.replace("'", "''") + "'"
             ps_code = (
                 "Add-Type -AssemblyName System.Windows.Forms; "
                 "$n = New-Object System.Windows.Forms.NotifyIcon; "
                 "$n.Icon = [System.Drawing.SystemIcons]::Information; "
                 "$n.Visible = $true; "
-                f"$n.ShowBalloonTip(5000, {json.dumps(title)}, {json.dumps(message)}, [System.Windows.Forms.ToolTipIcon]::Info); "
+                f"$n.ShowBalloonTip(5000, {ps_quote(title)}, {ps_quote(message)}, [System.Windows.Forms.ToolTipIcon]::Info); "
                 "Start-Sleep -Milliseconds 800; $n.Dispose()"
             )
-            subprocess.run(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_code], capture_output=True, timeout=4)
-            return True
+            r = subprocess.run(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_code], capture_output=True, timeout=15)
+            return r.returncode == 0
+        if shutil.which("notify-send"):
+            return subprocess.run(["notify-send", title, message], capture_output=True, timeout=10).returncode == 0
     except Exception:
         pass
     return False
@@ -831,7 +889,9 @@ def run_one_chunk(
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    env["MINERU_MODEL_SMALL_BACKEND"] = "onnx"
+    if tier == "basic":
+        # With torch present in the venv, MinerU's "auto" picks torch and tries to download torch models.
+        env["MINERU_MODEL_SMALL_BACKEND"] = "onnx"
     if models_ready():
         env["HF_HUB_OFFLINE"] = "1"
     thr = str(max(1, threads_per_worker))
@@ -876,6 +936,9 @@ def render_chunks_to_pages(
     *,
     mineru_py: Path,
     pdf_offset: int | None,
+    source_pdf: Path | None = None,
+    assets_root: Path | None = None,
+    asset_rel_prefix: str = "",
 ) -> tuple[list[dict], dict]:
     helper = r"""
 import json, pathlib, sys
@@ -883,7 +946,43 @@ import docvortex
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 out_path = pathlib.Path(sys.argv[2])
+src_pdf = manifest.get("source_pdf")
+assets_dir = pathlib.Path(manifest["assets_dir"]) if manifest.get("assets_dir") else None
+rel_prefix = manifest.get("asset_rel_prefix", "")
 results = []
+cropped_count = 0
+
+pdf_doc = None
+if src_pdf and assets_dir and pathlib.Path(src_pdf).is_file():
+    try:
+        import pypdfium2 as pdfium
+        pdf_doc = pdfium.PdfDocument(src_pdf)
+    except Exception:
+        pdf_doc = None
+
+page_pil_cache = {}
+def crop_visual_bbox(pdf_page_1based, bbox, dest_file):
+    if pdf_doc is None or not bbox or len(bbox) < 4:
+        return False
+    p_idx = pdf_page_1based - 1
+    if not (0 <= p_idx < len(pdf_doc)):
+        return False
+    if p_idx not in page_pil_cache:
+        page_pil_cache.clear()
+        page_pil_cache[p_idx] = pdf_doc[p_idx].render(scale=200.0 / 72.0).to_pil()
+    pil_img = page_pil_cache[p_idx]
+    w, h = pil_img.size
+    x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
+    # MinerU 4.x middle_json stores normalized [0..1] coordinates; handle pixel coords if >1.5
+    if max(x1, y1) <= 1.5:
+        box = (max(0, int(x0 * w) - 4), max(0, int(y0 * h) - 4), min(w, int(x1 * w) + 4), min(h, int(y1 * h) + 4))
+    else:
+        box = (max(0, int(x0)), max(0, int(y0)), min(w, int(x1)), min(h, int(y1)))
+    if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+        return False
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    pil_img.crop(box).save(dest_file, format="PNG")
+    return dest_file.is_file()
 
 def flatten_text(blk):
     parts = []
@@ -900,6 +999,7 @@ for start_p, end_p, cpath in manifest["chunks"]:
     for idx, pg in enumerate(pages):
         pdf_page = start_p + idx
         strict_nums, footers, headers = [], [], []
+        vis_idx = 0
         for blk in pg.get("blocks", []):
             btype = blk.get("type")
             if btype in ("page_number", "number"):
@@ -914,6 +1014,16 @@ for start_p, end_p, cpath in manifest["chunks"]:
                 val = flatten_text(blk)
                 if val:
                     headers.append(val)
+            elif btype in ("image", "chart") and assets_dir is not None:
+                for ch in (blk.get("content") or []):
+                    if isinstance(ch, dict) and ch.get("type") in ("image_body", "chart_body") and not ch.get("image_path"):
+                        vis_idx += 1
+                        fname = f"p{pdf_page:04d}_{btype}_{vis_idx}.png"
+                        dest_f = assets_dir / fname
+                        bbox = ch.get("bbox") or blk.get("bbox")
+                        if dest_f.is_file() or crop_visual_bbox(pdf_page, bbox, dest_f):
+                            ch["image_path"] = f"{rel_prefix}{fname}"
+                            cropped_count += 1
         cands = strict_nums + [ft for ft in footers if len(ft) <= 10]
         single_doc = {
             "schema": raw.get("schema", "docvortex.middle"),
@@ -925,6 +1035,11 @@ for start_p, end_p, cpath in manifest["chunks"]:
         }
         mj = docvortex.schema.MiddleJson.model_validate(single_doc)
         md = docvortex.render_artifact(mj, "markdown").content.decode("utf-8").strip()
+        if rel_prefix:
+            import urllib.parse as _up
+            q_pref = _up.quote(rel_prefix, safe="/_-.")
+            if q_pref != rel_prefix:
+                md = md.replace(f"]({q_pref}", f"]({rel_prefix}")
         results.append({
             "pdf_page": pdf_page,
             "ocr_page": cands[0] if cands else None,
@@ -933,12 +1048,21 @@ for start_p, end_p, cpath in manifest["chunks"]:
             "markdown": md,
         })
 
-out_path.write_text(json.dumps(results, ensure_ascii=False), encoding="utf-8")
+if pdf_doc is not None:
+    pdf_doc.close()
+
+out_path.write_text(json.dumps({"pages": results, "cropped_visual_assets": cropped_count}, ensure_ascii=False), encoding="utf-8")
 """
     with tempfile.TemporaryDirectory(prefix="pdf2md-render-") as td:
         in_p = Path(td) / "in.json"
         out_p = Path(td) / "out.json"
-        in_p.write_text(json.dumps({"chunks": [[s, e, str(p)] for s, e, p in chunk_targets]}, ensure_ascii=False), encoding="utf-8")
+        payload = {
+            "chunks": [[s, e, str(p)] for s, e, p in chunk_targets],
+            "source_pdf": str(source_pdf) if source_pdf else None,
+            "assets_dir": str(assets_root) if assets_root else None,
+            "asset_rel_prefix": asset_rel_prefix,
+        }
+        in_p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         subprocess.run(
             [str(mineru_py), "-c", helper, str(in_p), str(out_p)],
             check=True,
@@ -947,8 +1071,10 @@ out_path.write_text(json.dumps(results, ensure_ascii=False), encoding="utf-8")
             encoding="utf-8",
             errors="replace",
         )
-        pages = json.loads(out_p.read_text(encoding="utf-8"))
+        out_data = json.loads(out_p.read_text(encoding="utf-8"))
+        pages = out_data["pages"]
     pag_info = infer_pagination(pages, explicit_offset=pdf_offset)
+    pag_info["cropped_visual_assets"] = out_data.get("cropped_visual_assets", 0)
     return pages, pag_info
 
 
@@ -988,18 +1114,23 @@ def format_markdown(
         book_p = pg["book_page"]
         ocr_p = (pg.get("ocr_page") or "").replace("-->", "—>").replace("|", "/")
         hdr = (pg.get("header") or "").replace("-->", "—>")
+        basis = pg.get("book_page_basis")
         meta = [f"pdf_page: {pdf_p}", f"book_page: {book_p}"]
+        if basis:
+            meta.append(f"basis: {basis}")
         if ocr_p and len(ocr_p) <= 20:
             meta.append(f"ocr_page: {ocr_p}")
         if hdr:
             meta.append(f"header: {hdr}")
         lines.append(f"<!-- {' | '.join(meta)} -->")
+        # 本页没印页码、按相邻页码段向外推出来的页码，标题里注明，引用前应看原图
+        guess = "（无印刷页码，推算）" if basis == "extrapolated" else ""
         if book_p == "unnumbered":
             book_disp = "原书未标页码"
         elif book_p.startswith("back-"):
-            book_disp = f"原书附页 p.{book_p[5:]}"
+            book_disp = f"原书附页 p.{book_p[5:]}{guess}"
         else:
-            book_disp = f"原书 p.{book_p}"
+            book_disp = f"原书 p.{book_p}{guess}"
         hdr_disp = f" · {hdr}" if hdr else ""
         lines.append(f"### [PDF p.{pdf_p} | {book_disp}{hdr_disp}]")
         lines.append("")
@@ -1015,13 +1146,15 @@ def cmd_verify(md_path: Path, expected_pages: int | None = None) -> dict:
     md_real = Path(md_path).expanduser().resolve(strict=True)
     text = md_real.read_text(encoding="utf-8")
     anchor_re = re.compile(
-        r"^<!--\s*pdf_page:\s*(\d+)\s*\|\s*book_page:\s*([^|>]+?)(?:\s*\|\s*ocr_page:\s*([^|>]+?))?(?:\s*\|\s*header:\s*([^>]+?))?\s*-->$",
+        r"^<!--\s*pdf_page:\s*(\d+)\s*\|\s*book_page:\s*([^|>]+?)(?:\s*\|\s*basis:\s*([a-z]+))?"
+        r"(?:\s*\|\s*ocr_page:\s*([^|>]+?))?(?:\s*\|\s*header:\s*([^>]+?))?\s*-->$",
         re.MULTILINE,
     )
     matches = list(anchor_re.finditer(text))
     pdf_pages = [int(m.group(1)) for m in matches]
     book_pages = [m.group(2).strip() for m in matches]
-    ocr_pages = [(m.group(3) or "").strip() for m in matches]
+    bases = [m.group(3) or "" for m in matches]
+    ocr_pages = [(m.group(4) or "").strip() for m in matches]
 
     non_empty = 0
     invalid_labels: list[dict] = []
@@ -1036,8 +1169,22 @@ def cmd_verify(md_path: Path, expected_pages: int | None = None) -> dict:
         op = ocr_pages[idx]
         if not VALID_BOOK_PAGE_RE.match(bp):
             invalid_labels.append({"pdf_page": pdf_pages[idx], "book_page": bp})
-        elif bp.isdigit() and op and op != bp:
+        elif bases[idx] == "corrected" or (not bases[idx] and bp.isdigit() and op and op != bp):
             ocr_corrected_pages.append({"pdf_page": pdf_pages[idx], "book_page": bp, "ocr_raw": op})
+
+    # Independent of how labels were computed: consecutive numbered pages must advance one by one,
+    # except where a new run of numbers starts (listed so a human can look at those spots).
+    numbering_breaks: list[dict] = []
+    prev: tuple[int, str, int] | None = None
+    for pdf_p, bp in zip(pdf_pages, book_pages):
+        kind = "back" if bp.startswith("back-") else ("arabic" if bp.isdigit() else ("roman" if roman_to_int(bp) else None))
+        if kind is None:
+            continue
+        val = int(bp[5:]) if kind == "back" else (int(bp) if kind == "arabic" else roman_to_int(bp))
+        if prev and prev[1] == kind and val - prev[2] != pdf_p - prev[0]:
+            numbering_breaks.append({"after_pdf_page": prev[0], "pdf_page": pdf_p, "book_page": bp})
+        prev = (pdf_p, kind, val)
+    basis_counts = collections.Counter(b or ("unnumbered" if bp == "unnumbered" else "unknown") for b, bp in zip(bases, book_pages))
 
     duplicates = len(pdf_pages) - len(set(pdf_pages))
     missing: list[int] = []
@@ -1046,11 +1193,15 @@ def cmd_verify(md_path: Path, expected_pages: int | None = None) -> dict:
         missing = [p for p in range(1, expected_pages + 1) if p not in present]
 
     numbered_book_pages = sum(1 for b in book_pages if b != "unnumbered")
+    img_links = re.findall(r"!\[[^\]]*\]\(([^)\s]+)\)", text)
+    local_img_links = [lk for lk in img_links if not lk.startswith(("http://", "https://", "data:"))]
+    missing_assets = [lk for lk in local_img_links if not (md_real.parent / urllib.parse.unquote(lk)).is_file()]
     ok = (
         len(pdf_pages) > 0
         and duplicates == 0
         and len(missing) == 0
         and len(invalid_labels) == 0
+        and len(missing_assets) == 0
         and (expected_pages is None or len(pdf_pages) == expected_pages)
     )
     return {
@@ -1066,6 +1217,11 @@ def cmd_verify(md_path: Path, expected_pages: int | None = None) -> dict:
         "invalid_book_page_labels": invalid_labels[:20],
         "non_empty_text_pages": non_empty,
         "book_page_labeled_count": numbered_book_pages,
+        "visual_assets_count": len(local_img_links),
+        "missing_visual_assets": missing_assets[:20],
+        "book_page_basis_counts": dict(basis_counts),
+        "extrapolated_pages": [p for p, b in zip(pdf_pages, bases) if b == "extrapolated"][:40],
+        "numbering_breaks": numbering_breaks[:20],
         "ocr_misreads_corrected_count": len(ocr_corrected_pages),
         "ocr_misreads_corrected_sample": ocr_corrected_pages[:15],
     }
@@ -1074,18 +1230,46 @@ def cmd_verify(md_path: Path, expected_pages: int | None = None) -> dict:
 def cmd_status(target: str, *, vault: Path) -> dict:
     p = Path(target).expanduser()
     if p.is_file() and p.name == "status.json":
-        return json.loads(p.read_text(encoding="utf-8"))
+        return with_liveness(json.loads(p.read_text(encoding="utf-8")))
     slug = slugify(p.stem if p.suffix.lower() == ".pdf" else target)
-    st_path = status_file_for_slug(slug)
+    st_path = status_file_for_slug(slug, vault)
     if st_path.is_file():
-        return json.loads(st_path.read_text(encoding="utf-8"))
+        return with_liveness(json.loads(st_path.read_text(encoding="utf-8")))
     # Also scan vault ocr-cache for status.json matching slug
     croot = Path(vault).expanduser().resolve() / ".vault-meta" / "ocr-cache"
     if croot.is_dir():
         matches = sorted(croot.glob(f"{slug}_*/status.json"), key=lambda x: x.stat().st_mtime, reverse=True)
         if matches:
-            return json.loads(matches[0].read_text(encoding="utf-8"))
+            return with_liveness(json.loads(matches[0].read_text(encoding="utf-8")))
     return {"ok": False, "state": "not_found", "slug": slug}
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if platform.system() == "Windows":
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def with_liveness(st: dict) -> dict:
+    """A 'running' status whose process is gone means the run was interrupted (resume by re-running convert)."""
+    if st.get("state") == "running" and st.get("host") == socket.gethostname() and st.get("pid") and not pid_alive(int(st["pid"])):
+        st = dict(st, state="interrupted", ok=False,
+                  hint="转换进程已不在运行；重跑同一条 convert 命令会跳过已完成的分块继续转。")
+    return st
 
 
 def cmd_convert(
@@ -1103,6 +1287,7 @@ def cmd_convert(
     threads_per_worker: int | None = None,
     out_file: Path | None = None,
     notify: bool = True,
+    overwrite: bool = False,
 ) -> dict:
     doc = cmd_doctor(venv_dir)
     if not doc["ok"]:
@@ -1143,8 +1328,28 @@ def cmd_convert(
     newly_computed_pages = 0
     completed_pages = 0
     status_lock = threading.Lock()
-    job_status_path = status_file_for_slug(book_slug)
+    job_status_path = status_file_for_slug(book_slug, vault_real)
     cache_status_path = cdir / "status.json"
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Refuse a second concurrent run of the same book into the same vault.
+    prev_status: dict = {}
+    for sp in (job_status_path, cache_status_path):
+        if sp.is_file():
+            try:
+                prev_status = json.loads(sp.read_text(encoding="utf-8"))
+                break
+            except ValueError:
+                pass
+    if with_liveness(prev_status).get("state") == "running" and prev_status.get("pid") != os.getpid():
+        raise RuntimeError(f"同一本书已有转换在运行（pid {prev_status.get('pid')}）；用 status 查看进度，不要重复启动。")
+    # Never silently replace a Markdown file this tool did not write last time (e.g. a registered source).
+    last_output_sha = prev_status.get("last_output_sha256") or (prev_status.get("verification") or {}).get("sha256")
+    if target_md.exists() and not overwrite and sha256_file(target_md) != last_output_sha:
+        raise RuntimeError(
+            f"目标文件已存在且不是本工具上次生成的版本：{target_md}。"
+            "换 --slug 另存，或确认要替换后加 --overwrite（旧文件先备份到 .vault-meta/ocr-backup/）。"
+        )
 
     def publish_status(state: str, extra: dict | None = None) -> None:
         elapsed_now = round(time.perf_counter() - t0, 2)
@@ -1157,6 +1362,11 @@ def cmd_convert(
             "title": book_title,
             "source_pdf": str(pdf_real),
             "output_markdown": str(target_md),
+            "last_output_sha256": last_output_sha,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "tier": tier,
+            "started_at": started_at,
             "completed_pages": completed_pages,
             "selected_pages": selected_pages,
             "newly_computed_pages": newly_computed_pages,
@@ -1206,7 +1416,15 @@ def cmd_convert(
                     flush=True,
                 )
 
-        rendered, pag_info = render_chunks_to_pages(chunk_targets, mineru_py=py, pdf_offset=pdf_offset)
+        assets_dir = target_md.parent / "assets" / book_slug
+        rendered, pag_info = render_chunks_to_pages(
+            chunk_targets,
+            mineru_py=py,
+            pdf_offset=pdf_offset,
+            source_pdf=pdf_real,
+            assets_root=assets_dir,
+            asset_rel_prefix=f"assets/{book_slug}/",
+        )
         effective_offset = pag_info.get("body_offset")
         md_text = format_markdown(
             title=book_title,
@@ -1219,10 +1437,20 @@ def cmd_convert(
         )
 
         target_md.parent.mkdir(parents=True, exist_ok=True)
+        backup = None
+        if target_md.exists() and sha256_file(target_md) != last_output_sha:
+            # --overwrite of a file this tool did not write last: keep a copy first
+            bdir = vault_real / ".vault-meta" / "ocr-backup"
+            bdir.mkdir(parents=True, exist_ok=True)
+            backup = bdir / f"{target_md.stem}.{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+            shutil.copy2(target_md, backup)
+        tmp_md = target_md.with_name(f".{target_md.name}.tmp.{os.getpid()}")
+        tmp_md.write_text(md_text, encoding="utf-8")
         if target_md.exists():
-            set_file_readonly(target_md, readonly=False)
-        target_md.write_text(md_text, encoding="utf-8")
+            set_file_readonly(target_md, readonly=False)  # Windows cannot replace a read-only file
+        os.replace(tmp_md, target_md)
         set_file_readonly(target_md, readonly=True)
+        last_output_sha = sha256_file(target_md)
 
         if sha256_file(pdf_real) != sha_before:
             raise RuntimeError("Source PDF modified unexpectedly during OCR")
@@ -1264,6 +1492,8 @@ def cmd_convert(
             "pdf_offset_used": effective_offset,
             "roman_offset_used": pag_info.get("roman_offset"),
             "back_offset_used": pag_info.get("back_offset"),
+            "page_number_segments": pag_info.get("segments"),
+            "replaced_file_backup": str(backup) if backup else None,
             "workers_used": eff_workers,
             "chunk_size_used": eff_chunk,
             "elapsed_sec": elapsed,
@@ -1274,11 +1504,39 @@ def cmd_convert(
             "llm_tokens_used": 0,
             "verification": ver,
         }
-        publish_status("done", {"verification": ver, "pdf_offset_used": effective_offset})
+        publish_status("done", {"verification": ver, "pdf_offset_used": effective_offset,
+                                "page_number_segments": pag_info.get("segments")})
         return result
     except Exception as exc:
         publish_status("error", {"error": str(exc)})
         raise
+
+
+def spawn_background_convert(args: argparse.Namespace, raw_argv: list[str]) -> dict:
+    """Re-run the same convert detached from the calling agent; progress goes to status.json and a log."""
+    pdf_real = Path(args.pdf).expanduser().resolve(strict=True)
+    book_slug = slugify(args.slug or pdf_real.stem)
+    log_path = status_file_for_slug(book_slug, args.vault).with_suffix(".log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, str(Path(__file__).resolve())] + [a for a in raw_argv if a != "--background"]
+    kwargs: dict = {"stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT, "close_fds": True}
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    with log_path.open("ab") as log:
+        proc = subprocess.Popen(cmd, stdout=log, **kwargs)
+    status_target = book_slug if args.slug else str(pdf_real)
+    vault_real = Path(args.vault).expanduser().resolve()
+    status_cmd = f'"{sys.executable}" "{Path(__file__).resolve()}" status "{status_target}" --vault "{vault_real}"'
+    return {
+        "ok": True,
+        "state": "started",
+        "pid": proc.pid,
+        "log": str(log_path),
+        "status_command": status_cmd,
+        "human_message": f"已在后台开始转换《{pdf_real.stem}》（进程 {proc.pid}）。完成时系统会弹通知；随时可查进度：{status_cmd}",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1322,6 +1580,8 @@ def main(argv: list[str] | None = None) -> int:
     p_conv.add_argument("--threads-per-worker", type=int, default=None)
     p_conv.add_argument("--out", type=Path, default=None)
     p_conv.add_argument("--no-notify", action="store_true", help="Suppress OS desktop notification")
+    p_conv.add_argument("--overwrite", action="store_true", help="Replace an existing .md this tool did not write last (backed up first)")
+    p_conv.add_argument("--background", action="store_true", help="Start detached and return at once; poll with `status`")
 
     p_stat = sub.add_parser("status", help="Read live progress / ETA of a running or finished convert")
     p_stat.add_argument("target", type=str, help="PDF path, slug, or status.json path")
@@ -1331,8 +1591,13 @@ def main(argv: list[str] | None = None) -> int:
     p_ver.add_argument("markdown", type=Path)
     p_ver.add_argument("--expected-pages", type=int, default=None)
 
-    args = p.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = p.parse_args(raw_argv)
     try:
+        if args.cmd == "convert" and args.background:
+            res = spawn_background_convert(args, raw_argv)
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
         if args.cmd == "doctor":
             res = cmd_doctor(args.venv)
         elif args.cmd == "setup":
@@ -1354,6 +1619,7 @@ def main(argv: list[str] | None = None) -> int:
                 threads_per_worker=args.threads_per_worker,
                 out_file=args.out,
                 notify=not args.no_notify,
+                overwrite=args.overwrite,
             )
         elif args.cmd == "status":
             res = cmd_status(args.target, vault=args.vault)

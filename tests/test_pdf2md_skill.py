@@ -127,5 +127,23 @@ class TestPdf2MdSkill(unittest.TestCase):
             self.assertEqual(len(ver_bad_lbl["invalid_book_page_labels"]), 1)
 
 
+            # Verify missing local image asset is caught by cmd_verify, and present asset passes
+            pdf2md.set_file_readonly(md_path, readonly=False)
+            asset_rel = "assets/demo/p0002_image_1.png"
+            with_img = md_text + f"\n![]({asset_rel})\n"
+            md_path.write_text(with_img, encoding="utf-8")
+            ver_missing_img = pdf2md.cmd_verify(md_path, expected_pages=2)
+            self.assertFalse(ver_missing_img["ok"])
+            self.assertEqual(ver_missing_img["missing_visual_assets"], [asset_rel])
+
+            asset_file = Path(td) / asset_rel
+            asset_file.parent.mkdir(parents=True, exist_ok=True)
+            asset_file.write_bytes(b"PNG-DATA")
+            ver_ok_img = pdf2md.cmd_verify(md_path, expected_pages=2)
+            self.assertTrue(ver_ok_img["ok"])
+            self.assertEqual(ver_ok_img["visual_assets_count"], 1)
+            self.assertEqual(ver_ok_img["missing_visual_assets"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
