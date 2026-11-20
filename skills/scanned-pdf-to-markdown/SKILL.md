@@ -3,9 +3,9 @@ name: scanned-pdf-to-markdown
 description: Convert scanned or image-based PDF books and papers into page-anchored Markdown (`PDF p.X | 原书 p.Y`) inside Obsidian `brain/raw/books/` using free local MinerU 4.2 ONNX models with 0 LLM tokens, preflight ETA, background run, live status, OS completion notification, and automatic resume.触发词：扫描版PDF转Markdown、图片PDF转md、电子书入库raw/books。
 ---
 
-# Scanned PDF to Markdown (LLM-Wiki Step 1 · v2.2)
+# Scanned PDF to Markdown (LLM-Wiki Step 1 · v2.3)
 
-把扫描版/图片版 PDF 在本机免费转成 Markdown：每页带 PDF 页码和原书印刷页码，表格转为结构化 Markdown/HTML 表，插图与数据图表（`image` / `chart`）按版面检测坐标自动裁切为 PNG 附件存入 `raw/books/assets/<书名>/` 并内嵌链接，默认存进 `~/Documents/brain/raw/books/<书名>.md`（设了 `PDF2MD_VAULT` 就存进那个库），文件只读；中断后重跑同一条命令会跳过已转完的分块。
+把扫描版/图片版 PDF 在本机免费一次性转成 Markdown：每页带 PDF 页码和原书印刷页码，表格转为结构化 Markdown/HTML 表，插图与数据图表（`image` / `chart`）在每个分块转换时同步按坐标自动裁切为 PNG 附件存入 `raw/books/assets/<书名>/` 并内嵌链接，常规识别为空的深色/低对比度扫描页自动做光照均衡重识并附原页快照（仅真正空白页标 `*[空白页]*`），默认存进 `~/Documents/brain/raw/books/<书名>.md`（设了 `PDF2MD_VAULT` 就存进那个库），文件只读；中断后重跑同一条命令会跳过已转完的分块。
 
 脚本（下文记作 `pdf2md`）：
 - Mac / Linux：`python3 ~/.agents/skills/scanned-pdf-to-markdown/scripts/pdf2md.py`

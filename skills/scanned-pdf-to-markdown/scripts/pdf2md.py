@@ -41,7 +41,7 @@ import time
 import urllib.parse
 import urllib.request
 
-SKILL_VERSION = "2.2.0"
+SKILL_VERSION = "2.3.0"
 OUTPUT_ENGINE_TAG = f"scanned-pdf-to-markdown/{SKILL_VERSION}"
 
 ROMAN_RE = re.compile(
@@ -138,7 +138,10 @@ def get_memory_gb() -> tuple[float, float]:
         stat = MEMORYSTATUSEX()
         stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-            return round(stat.ullTotalPhys / (1024 ** 3), 2), round(stat.ullAvailPhys / (1024 ** 3), 2)
+            avail_phys = stat.ullAvailPhys / (1024 ** 3)
+            avail_commit = stat.ullAvailPageFile / (1024 ** 3)
+            eff_avail = min(avail_phys, avail_commit) if avail_commit > 0 else avail_phys
+            return round(stat.ullTotalPhys / (1024 ** 3), 2), round(eff_avail, 2)
     elif sysname == "Darwin":
         try:
             tot = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, timeout=3).strip())
@@ -732,7 +735,7 @@ def cmd_setup(venv_dir: Path, source: str = "auto", models_from: Path | None = N
     pypi_index = choose_pypi_index()
     if not (py.is_file() and kit.is_file()):
         subprocess.run([uv, "venv", "--clear", str(venv_dir), "--python", "3.12"], check=True)
-        pip_cmd = [uv, "pip", "install", "--python", str(py), "-U", "mineru>=4.2,<5"]
+        pip_cmd = [uv, "pip", "install", "--no-cache", "--python", str(py), "-U", "mineru>=4.2,<5"]
         if pypi_index:
             pip_cmd.extend(["--index-url", pypi_index])
         res = subprocess.run(pip_cmd)
@@ -872,19 +875,120 @@ def cmd_estimate(
     }
 
 
+def crop_chunk_visuals(
+    *,
+    pdf_path: Path,
+    start_page: int,
+    chunk_json: Path,
+    mineru_py: Path,
+    assets_root: Path | None,
+    asset_rel_prefix: str = "",
+) -> int:
+    """Crop image/chart blocks for a single chunk immediately during conversion so visual PNGs are
+    produced inline in the same single-pass pipeline."""
+    if assets_root is None or not chunk_json.is_file():
+        return 0
+    raw = json.loads(chunk_json.read_text(encoding="utf-8"))
+    has_visual = any(
+        blk.get("type") in ("image", "chart")
+        for pg in raw.get("pages", [])
+        for blk in pg.get("blocks", [])
+    )
+    if not has_visual:
+        return 0
+    helper = r"""
+import json, pathlib, sys
+import pypdfium2 as pdfium
+
+src_pdf, cpath, assets_dir, rel_prefix, start_p = (
+    sys.argv[1],
+    pathlib.Path(sys.argv[2]),
+    pathlib.Path(sys.argv[3]),
+    sys.argv[4],
+    int(sys.argv[5]),
+)
+raw = json.loads(cpath.read_text(encoding="utf-8"))
+doc = pdfium.PdfDocument(src_pdf)
+count = 0
+changed = False
+for idx, pg in enumerate(raw.get("pages", [])):
+    pdf_page = start_p + idx
+    p_idx = pdf_page - 1
+    if not (0 <= p_idx < len(doc)):
+        continue
+    pil_img = None
+    vis_idx = 0
+    for blk in pg.get("blocks", []):
+        btype = blk.get("type")
+        if btype not in ("image", "chart"):
+            continue
+        for ch in (blk.get("content") or []):
+            if isinstance(ch, dict) and ch.get("type") in ("image_body", "chart_body"):
+                vis_idx += 1
+                fname = f"p{pdf_page:04d}_{btype}_{vis_idx}.png"
+                dest_f = assets_dir / fname
+                bbox = ch.get("bbox") or blk.get("bbox")
+                if not dest_f.is_file() and bbox and len(bbox) >= 4:
+                    if pil_img is None:
+                        pil_img = doc[p_idx].render(scale=200.0 / 72.0).to_pil()
+                    w, h = pil_img.size
+                    x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
+                    if max(x1, y1) <= 1.5:
+                        box = (max(0, int(x0 * w) - 4), max(0, int(y0 * h) - 4), min(w, int(x1 * w) + 4), min(h, int(y1 * h) + 4))
+                    else:
+                        box = (max(0, int(x0)), max(0, int(y0)), min(w, int(x1)), min(h, int(y1)))
+                    if box[2] - box[0] >= 8 and box[3] - box[1] >= 8:
+                        dest_f.parent.mkdir(parents=True, exist_ok=True)
+                        pil_img.crop(box).save(dest_f, format="PNG")
+                if dest_f.is_file():
+                    rel_val = f"{rel_prefix}{fname}"
+                    if ch.get("image_path") != rel_val:
+                        ch["image_path"] = rel_val
+                        changed = True
+                    count += 1
+doc.close()
+if changed:
+    cpath.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+print(count)
+"""
+    proc = subprocess.run(
+        [str(mineru_py), "-c", helper, str(pdf_path), str(chunk_json), str(assets_root), asset_rel_prefix, str(start_page)],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        return int(proc.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return 0
+
+
 def run_one_chunk(
     *,
     pdf_path: Path,
     start_page: int,
     end_page: int,
     out_json: Path,
+    mineru_py: Path,
     mineru_kit: Path,
     tier: str,
     threads_per_worker: int,
+    assets_root: Path | None = None,
+    asset_rel_prefix: str = "",
 ) -> dict:
     expected = end_page - start_page + 1
     if chunk_is_valid(out_json, expected):
-        return {"start": start_page, "end": end_page, "cached": True, "sec": 0.0}
+        cropped = crop_chunk_visuals(
+            pdf_path=pdf_path,
+            start_page=start_page,
+            chunk_json=out_json,
+            mineru_py=mineru_py,
+            assets_root=assets_root,
+            asset_rel_prefix=asset_rel_prefix,
+        )
+        return {"start": start_page, "end": end_page, "cached": True, "sec": 0.0, "cropped": cropped}
 
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
@@ -892,6 +996,10 @@ def run_one_chunk(
     if tier == "basic":
         # With torch present in the venv, MinerU's "auto" picks torch and tries to download torch models.
         env["MINERU_MODEL_SMALL_BACKEND"] = "onnx"
+        if platform.system() == "Windows" and "MINERU_MODEL_ONNX_DEVICE" not in env:
+            # Bypass MinerU's 15s subprocess onnx_calibration race/timeout on integrated DirectML GPUs;
+            # MinerU still falls back to CPU automatically if DirectML or a hardware GPU is absent.
+            env["MINERU_MODEL_ONNX_DEVICE"] = "gpu"
     if models_ready():
         env["HF_HUB_OFFLINE"] = "1"
     thr = str(max(1, threads_per_worker))
@@ -927,42 +1035,65 @@ def run_one_chunk(
     )
     if not chunk_is_valid(tmp_json, expected):
         raise RuntimeError(f"Chunk {start_page}-{end_page} output invalid")
+    cropped = crop_chunk_visuals(
+        pdf_path=pdf_path,
+        start_page=start_page,
+        chunk_json=tmp_json,
+        mineru_py=mineru_py,
+        assets_root=assets_root,
+        asset_rel_prefix=asset_rel_prefix,
+    )
     os.replace(tmp_json, out_json)
-    return {"start": start_page, "end": end_page, "cached": False, "sec": round(time.perf_counter() - t0, 2)}
+    return {"start": start_page, "end": end_page, "cached": False, "sec": round(time.perf_counter() - t0, 2), "cropped": cropped}
 
 
 def render_chunks_to_pages(
     chunk_targets: list[tuple[int, int, Path]],
     *,
     mineru_py: Path,
+    mineru_kit: Path | None = None,
+    tier: str = "basic",
+    cache_dir: Path | None = None,
     pdf_offset: int | None,
     source_pdf: Path | None = None,
     assets_root: Path | None = None,
     asset_rel_prefix: str = "",
 ) -> tuple[list[dict], dict]:
     helper = r"""
-import json, pathlib, sys
+import json, os, pathlib, re, subprocess, sys, tempfile
 import docvortex
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 out_path = pathlib.Path(sys.argv[2])
 src_pdf = manifest.get("source_pdf")
 assets_dir = pathlib.Path(manifest["assets_dir"]) if manifest.get("assets_dir") else None
+cache_dir = pathlib.Path(manifest["cache_dir"]) if manifest.get("cache_dir") else None
+mineru_kit = manifest.get("mineru_kit")
+tier = manifest.get("tier") or "basic"
+models_ready_flag = bool(manifest.get("models_ready"))
 rel_prefix = manifest.get("asset_rel_prefix", "")
 results = []
 cropped_count = 0
+fallback_pages = []
+blank_pages = []
 
 pdf_doc = None
-if src_pdf and assets_dir and pathlib.Path(src_pdf).is_file():
+np = None
+Image = None
+if src_pdf and pathlib.Path(src_pdf).is_file():
     try:
+        import numpy as _np
+        from PIL import Image as _Image
         import pypdfium2 as pdfium
         pdf_doc = pdfium.PdfDocument(src_pdf)
+        np = _np
+        Image = _Image
     except Exception:
         pdf_doc = None
 
 page_pil_cache = {}
 def crop_visual_bbox(pdf_page_1based, bbox, dest_file):
-    if pdf_doc is None or not bbox or len(bbox) < 4:
+    if pdf_doc is None or assets_dir is None or not bbox or len(bbox) < 4:
         return False
     p_idx = pdf_page_1based - 1
     if not (0 <= p_idx < len(pdf_doc)):
@@ -973,7 +1104,6 @@ def crop_visual_bbox(pdf_page_1based, bbox, dest_file):
     pil_img = page_pil_cache[p_idx]
     w, h = pil_img.size
     x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
-    # MinerU 4.x middle_json stores normalized [0..1] coordinates; handle pixel coords if >1.5
     if max(x1, y1) <= 1.5:
         box = (max(0, int(x0 * w) - 4), max(0, int(y0 * h) - 4), min(w, int(x1 * w) + 4), min(h, int(y1 * h) + 4))
     else:
@@ -983,6 +1113,112 @@ def crop_visual_bbox(pdf_page_1based, bbox, dest_file):
     dest_file.parent.mkdir(parents=True, exist_ok=True)
     pil_img.crop(box).save(dest_file, format="PNG")
     return dest_file.is_file()
+
+def unwrap_single_col_pipe_table(md_str):
+    lines = [ln.strip() for ln in md_str.strip().splitlines() if ln.strip()]
+    if len(lines) < 2 or not all(ln.startswith("|") and ln.endswith("|") for ln in lines):
+        return md_str
+    cells = []
+    for ln in lines:
+        inner = [c.strip() for c in ln[1:-1].split("|")]
+        non_empty = [c for c in inner if c]
+        if len(non_empty) > 1:
+            return md_str
+        cell = non_empty[0] if non_empty else ""
+        if re.fullmatch(r"[-:\s]+", cell):
+            continue
+        if cell:
+            cells.append(cell)
+    joined = "\n\n".join(cells).strip()
+    return joined if len(joined) >= 80 else md_str
+
+def inspect_and_recover_empty_page(pdf_page_1based):
+    # Distinguish truly blank pages from dark/low-contrast scans or untagged plate pages.
+    if pdf_doc is None or np is None or Image is None:
+        return "blank", ""
+    p_idx = pdf_page_1based - 1
+    if not (0 <= p_idx < len(pdf_doc)):
+        return "blank", ""
+    pil_gray = pdf_doc[p_idx].render(scale=150.0 / 72.0).to_pil().convert("L")
+    arr150 = np.asarray(pil_gray, dtype=np.float32)
+    h0, w0 = arr150.shape
+    crop = arr150[int(h0 * 0.1):int(h0 * 0.9), int(w0 * 0.1):int(w0 * 0.9)]
+    if crop.size == 0:
+        return "blank", ""
+    bg_p85 = float(np.percentile(crop, 85))
+    ink_ratio = float(np.mean((bg_p85 - crop) > 35.0))
+    if ink_ratio < 0.003:
+        return "blank", ""
+
+    snap_md_link = ""
+    if assets_dir is not None:
+        fname = f"p{pdf_page_1based:04d}_scan_fallback.png"
+        dest_f = assets_dir / fname
+        if not dest_f.is_file():
+            dest_f.parent.mkdir(parents=True, exist_ok=True)
+            pdf_doc[p_idx].render(scale=200.0 / 72.0).to_pil().save(dest_f, format="PNG")
+        if dest_f.is_file():
+            snap_md_link = f"![]({rel_prefix}{fname})"
+
+    recovered_md = ""
+    if mineru_kit and pathlib.Path(mineru_kit).is_file():
+        fb_cache = (cache_dir / f"fallback_p{pdf_page_1based:04d}.json") if cache_dir else None
+        fb_raw = None
+        if fb_cache and fb_cache.is_file():
+            try:
+                fb_raw = json.loads(fb_cache.read_text(encoding="utf-8"))
+            except Exception:
+                fb_raw = None
+        if fb_raw is None:
+            try:
+                pil_hi = pdf_doc[p_idx].render(scale=250.0 / 72.0).to_pil().convert("L")
+                arr = np.asarray(pil_hi, dtype=np.float32)
+                hh, ww = arr.shape
+                gh, gw = max(8, hh // 48), max(8, ww // 48)
+                trimmed = arr[:gh * 48, :gw * 48].reshape(gh, 48, gw, 48)
+                grid_bg = np.percentile(trimmed, 85, axis=(1, 3)).astype(np.uint8)
+                bg = np.asarray(Image.fromarray(grid_bg).resize((ww, hh), Image.Resampling.BILINEAR), dtype=np.float32)
+                norm = np.clip((arr / np.maximum(bg, 50.0)) * 255.0, 0, 255)
+                clean = np.where(norm > 212, 255, np.clip((norm - 85.0) * (255.0 / 127.0), 0, 255)).astype(np.uint8)
+                with tempfile.TemporaryDirectory(prefix="pdf2md-fb-") as td:
+                    img_p = pathlib.Path(td) / "clean.png"
+                    out_j = pathlib.Path(td) / "out.json"
+                    Image.fromarray(clean).save(img_p)
+                    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+                    if tier == "basic":
+                        env["MINERU_MODEL_SMALL_BACKEND"] = "onnx"
+                        if sys.platform == "win32" and "MINERU_MODEL_ONNX_DEVICE" not in env:
+                            env["MINERU_MODEL_ONNX_DEVICE"] = "gpu"
+                    if models_ready_flag:
+                        env["HF_HUB_OFFLINE"] = "1"
+                    subprocess.run(
+                        [mineru_kit, "parse", str(img_p), "-o", str(out_j), "--format", "middle_json",
+                         "--tier", tier, "--ocr-mode", "ocr", "--disable-image-analysis"],
+                        env=env, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    )
+                    fb_raw = json.loads(out_j.read_text(encoding="utf-8"))
+                    if fb_cache:
+                        fb_cache.parent.mkdir(parents=True, exist_ok=True)
+                        fb_cache.write_text(json.dumps(fb_raw, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                fb_raw = None
+        if fb_raw and fb_raw.get("pages"):
+            try:
+                mj = docvortex.schema.MiddleJson.model_validate(fb_raw)
+                cand_md = docvortex.render_artifact(mj, "markdown").content.decode("utf-8").strip()
+                recovered_md = unwrap_single_col_pipe_table(cand_md)
+            except Exception:
+                recovered_md = ""
+
+    if recovered_md:
+        parts = ["> *[深色或低对比度扫描页：常规识别为空，已自动光照均衡重识并附原页快照]*", "", recovered_md]
+        if snap_md_link:
+            parts.extend(["", snap_md_link])
+        return "dark_scan_recovered", "\n".join(parts)
+    parts = ["> *[非空白图像/版面页：未检出可识别正文，已附原页快照]*"]
+    if snap_md_link:
+        parts.extend(["", snap_md_link])
+    return "image_snapshot", "\n".join(parts)
 
 def flatten_text(blk):
     parts = []
@@ -1016,7 +1252,7 @@ for start_p, end_p, cpath in manifest["chunks"]:
                     headers.append(val)
             elif btype in ("image", "chart") and assets_dir is not None:
                 for ch in (blk.get("content") or []):
-                    if isinstance(ch, dict) and ch.get("type") in ("image_body", "chart_body") and not ch.get("image_path"):
+                    if isinstance(ch, dict) and ch.get("type") in ("image_body", "chart_body"):
                         vis_idx += 1
                         fname = f"p{pdf_page:04d}_{btype}_{vis_idx}.png"
                         dest_f = assets_dir / fname
@@ -1040,18 +1276,39 @@ for start_p, end_p, cpath in manifest["chunks"]:
             q_pref = _up.quote(rel_prefix, safe="/_-.")
             if q_pref != rel_prefix:
                 md = md.replace(f"]({q_pref}", f"]({rel_prefix}")
+        fallback_kind = None
+        if not md:
+            kind, fb_md = inspect_and_recover_empty_page(pdf_page)
+            if kind == "blank":
+                blank_pages.append(pdf_page)
+            else:
+                fallback_kind = kind
+                fallback_pages.append(pdf_page)
+                md = fb_md
+                if snap := f"{rel_prefix}p{pdf_page:04d}_scan_fallback.png":
+                    if assets_dir is not None and (assets_dir / f"p{pdf_page:04d}_scan_fallback.png").is_file():
+                        cropped_count += 1
         results.append({
             "pdf_page": pdf_page,
             "ocr_page": cands[0] if cands else None,
             "page_num_candidates": cands,
             "header": " | ".join(headers) if headers else None,
+            "fallback": fallback_kind,
             "markdown": md,
         })
 
 if pdf_doc is not None:
     pdf_doc.close()
 
-out_path.write_text(json.dumps({"pages": results, "cropped_visual_assets": cropped_count}, ensure_ascii=False), encoding="utf-8")
+out_path.write_text(
+    json.dumps({
+        "pages": results,
+        "cropped_visual_assets": cropped_count,
+        "blank_pages": blank_pages,
+        "fallback_scan_pages": fallback_pages,
+    }, ensure_ascii=False),
+    encoding="utf-8",
+)
 """
     with tempfile.TemporaryDirectory(prefix="pdf2md-render-") as td:
         in_p = Path(td) / "in.json"
@@ -1060,6 +1317,10 @@ out_path.write_text(json.dumps({"pages": results, "cropped_visual_assets": cropp
             "chunks": [[s, e, str(p)] for s, e, p in chunk_targets],
             "source_pdf": str(source_pdf) if source_pdf else None,
             "assets_dir": str(assets_root) if assets_root else None,
+            "cache_dir": str(cache_dir) if cache_dir else None,
+            "mineru_kit": str(mineru_kit) if mineru_kit else None,
+            "tier": tier,
+            "models_ready": models_ready(),
             "asset_rel_prefix": asset_rel_prefix,
         }
         in_p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1075,6 +1336,8 @@ out_path.write_text(json.dumps({"pages": results, "cropped_visual_assets": cropp
         pages = out_data["pages"]
     pag_info = infer_pagination(pages, explicit_offset=pdf_offset)
     pag_info["cropped_visual_assets"] = out_data.get("cropped_visual_assets", 0)
+    pag_info["blank_pages"] = out_data.get("blank_pages", [])
+    pag_info["fallback_scan_pages"] = out_data.get("fallback_scan_pages", [])
     return pages, pag_info
 
 
@@ -1115,6 +1378,7 @@ def format_markdown(
         ocr_p = (pg.get("ocr_page") or "").replace("-->", "—>").replace("|", "/")
         hdr = (pg.get("header") or "").replace("-->", "—>")
         basis = pg.get("book_page_basis")
+        fb = pg.get("fallback")
         meta = [f"pdf_page: {pdf_p}", f"book_page: {book_p}"]
         if basis:
             meta.append(f"basis: {basis}")
@@ -1122,6 +1386,8 @@ def format_markdown(
             meta.append(f"ocr_page: {ocr_p}")
         if hdr:
             meta.append(f"header: {hdr}")
+        if fb:
+            meta.append(f"fallback: {fb}")
         lines.append(f"<!-- {' | '.join(meta)} -->")
         # 本页没印页码、按相邻页码段向外推出来的页码，标题里注明，引用前应看原图
         guess = "（无印刷页码，推算）" if basis == "extrapolated" else ""
@@ -1135,7 +1401,7 @@ def format_markdown(
         lines.append(f"### [PDF p.{pdf_p} | {book_disp}{hdr_disp}]")
         lines.append("")
         body = (pg.get("markdown") or "").strip()
-        lines.append(body if body else "*[空白页或纯插图页]*")
+        lines.append(body if body else "*[空白页]*")
         lines.append("")
         lines.append("---")
         lines.append("")
@@ -1147,7 +1413,7 @@ def cmd_verify(md_path: Path, expected_pages: int | None = None) -> dict:
     text = md_real.read_text(encoding="utf-8")
     anchor_re = re.compile(
         r"^<!--\s*pdf_page:\s*(\d+)\s*\|\s*book_page:\s*([^|>]+?)(?:\s*\|\s*basis:\s*([a-z]+))?"
-        r"(?:\s*\|\s*ocr_page:\s*([^|>]+?))?(?:\s*\|\s*header:\s*([^>]+?))?\s*-->$",
+        r"(?:\s*\|\s*ocr_page:\s*([^|>]+?))?(?:\s*\|\s*header:\s*([^>]+?))?(?:\s*\|\s*fallback:\s*([a-z_]+))?\s*-->$",
         re.MULTILINE,
     )
     matches = list(anchor_re.finditer(text))
@@ -1155,16 +1421,24 @@ def cmd_verify(md_path: Path, expected_pages: int | None = None) -> dict:
     book_pages = [m.group(2).strip() for m in matches]
     bases = [m.group(3) or "" for m in matches]
     ocr_pages = [(m.group(4) or "").strip() for m in matches]
+    fallbacks = [(m.group(6) or "").strip() for m in matches]
 
     non_empty = 0
+    blank_pages_found: list[int] = []
+    fallback_pages_found: list[int] = []
     invalid_labels: list[dict] = []
     ocr_corrected_pages: list[dict] = []
     for idx, m in enumerate(matches):
         start = m.end()
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
         seg = text[start:end]
-        if "*[空白页或纯插图页]*" not in seg and "*[本页为空白页或纯图像页]*" not in seg and len(seg.strip()) > 30:
+        is_blank_marker = any(mk in seg for mk in ("*[空白页]*", "*[空白页或纯插图页]*", "*[本页为空白页或纯图像页]*"))
+        if is_blank_marker:
+            blank_pages_found.append(pdf_pages[idx])
+        elif len(seg.strip()) > 30:
             non_empty += 1
+        if fallbacks[idx]:
+            fallback_pages_found.append(pdf_pages[idx])
         bp = book_pages[idx]
         op = ocr_pages[idx]
         if not VALID_BOOK_PAGE_RE.match(bp):
@@ -1216,6 +1490,8 @@ def cmd_verify(md_path: Path, expected_pages: int | None = None) -> dict:
         "duplicate_page_count": duplicates,
         "invalid_book_page_labels": invalid_labels[:20],
         "non_empty_text_pages": non_empty,
+        "blank_pages": blank_pages_found[:40],
+        "fallback_scan_pages": fallback_pages_found[:40],
         "book_page_labeled_count": numbered_book_pages,
         "visual_assets_count": len(local_img_links),
         "missing_visual_assets": missing_assets[:20],
@@ -1384,6 +1660,8 @@ def cmd_convert(
 
     publish_status("running")
 
+    assets_dir = target_md.parent / "assets" / book_slug
+    asset_prefix = f"assets/{book_slug}/"
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, eff_workers)) as pool:
             futs = {
@@ -1393,9 +1671,12 @@ def cmd_convert(
                     start_page=s,
                     end_page=e,
                     out_json=cp,
+                    mineru_py=py,
                     mineru_kit=kit,
                     tier=tier,
                     threads_per_worker=eff_threads,
+                    assets_root=assets_dir,
+                    asset_rel_prefix=asset_prefix,
                 ): (s, e)
                 for s, e, cp in chunk_targets
             }
@@ -1416,14 +1697,16 @@ def cmd_convert(
                     flush=True,
                 )
 
-        assets_dir = target_md.parent / "assets" / book_slug
         rendered, pag_info = render_chunks_to_pages(
             chunk_targets,
             mineru_py=py,
+            mineru_kit=kit,
+            tier=tier,
+            cache_dir=cdir,
             pdf_offset=pdf_offset,
             source_pdf=pdf_real,
             assets_root=assets_dir,
-            asset_rel_prefix=f"assets/{book_slug}/",
+            asset_rel_prefix=asset_prefix,
         )
         effective_offset = pag_info.get("body_offset")
         md_text = format_markdown(

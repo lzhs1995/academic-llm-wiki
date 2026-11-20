@@ -220,6 +220,44 @@ class TestPdf2MdSkill(unittest.TestCase):
             self.assertTrue(ver_ok_img["ok"])
             self.assertEqual(ver_ok_img["visual_assets_count"], 1)
             self.assertEqual(ver_ok_img["missing_visual_assets"], [])
+            self.assertEqual(ver_ok_img["blank_pages"], [1])
+
+    def test_dark_scan_fallback_anchor_and_blank_separation(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            snap_rel = "assets/book/p0002_scan_fallback.png"
+            (td_p / snap_rel).parent.mkdir(parents=True, exist_ok=True)
+            (td_p / snap_rel).write_bytes(b"PNG-SNAPSHOT")
+            md_path = td_p / "book.md"
+            md_text = pdf2md.format_markdown(
+                title="Dark Scan Demo",
+                source_pdf=Path("/tmp/dark.pdf"),
+                source_sha="a" * 64,
+                total_pdf_pages=3,
+                pdf_offset=None,
+                tier="basic",
+                pages=[
+                    {"pdf_page": 1, "book_page": "unnumbered", "ocr_page": None, "header": None, "markdown": ""},
+                    {
+                        "pdf_page": 2,
+                        "book_page": "unnumbered",
+                        "ocr_page": None,
+                        "header": "viii | England in 1760.",
+                        "fallback": "dark_scan_recovered",
+                        "markdown": f"> *[深色或低对比度扫描页]*\n\nRecovered text from dark scan.\n\n![]({snap_rel})",
+                    },
+                    {"pdf_page": 3, "book_page": "1", "book_page_basis": "printed", "ocr_page": "1", "header": "viii | Memoir.", "markdown": "Normal body text exceeding thirty characters."},
+                ],
+            )
+            md_path.write_text(md_text, encoding="utf-8")
+            ver = pdf2md.cmd_verify(md_path, expected_pages=3)
+            self.assertTrue(ver["ok"])
+            self.assertEqual(ver["verified_pages"], 3)
+            self.assertEqual(ver["blank_pages"], [1])
+            self.assertEqual(ver["fallback_scan_pages"], [2])
+            self.assertEqual(ver["non_empty_text_pages"], 2)
+            self.assertEqual(ver["visual_assets_count"], 1)
+            self.assertEqual(ver["missing_visual_assets"], [])
 
 
 if __name__ == "__main__":
